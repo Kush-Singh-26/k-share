@@ -1,0 +1,9 @@
+{
+  "port": "26260",
+  "github_token": "YOUR_GITHUB_TOKEN_HERE",
+  "gist_id": "YOUR_GIST_ID_HERE",
+  "gist_filename": "server.json",
+  "from_phone_dir": "C:\\k-share-data\\FromPhone",
+  "to_phone_dir": "C:\\k-share-data\\ToPhone",
+  "pairing_code": "create-a-secure-password"
+}

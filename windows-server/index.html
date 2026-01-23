@@ -1,0 +1,340 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>K-Share Web Terminal</title>
+    <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><rect width=%22100%22 height=%22100%22 rx=%2220%22 fill=%22%233F51B5%22/><path d=%22M30 25 v50 M30 50 l30 -25 M30 50 l30 25%22 stroke=%22white%22 stroke-width=%228%22 stroke-linecap=%22round%22/></svg>">
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #f0f2f5; margin: 0; padding: 20px; color: #333; }
+        .container { max-width: 1000px; margin: 0 auto; display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+        .card { background: white; border-radius: 12px; padding: 20px; box-shadow: 0 4px 6px rgba(0,0,0,0.05); }
+        .full-width { grid-column: 1 / -1; }
+        h1 { color: #3F51B5; margin: 0; font-size: 2.2rem; }
+        h2 { margin-top: 0; font-size: 1.1rem; border-bottom: 2px solid #eee; padding-bottom: 10px; color: #555; }
+        .editable-area { width: 100%; height: 150px; border: 1px solid #ddd; border-radius: 8px; padding: 12px; box-sizing: border-box; font-family: inherit; font-size: 1rem; margin-bottom: 10px; resize: vertical; overflow-y: auto; background: white; white-space: pre-wrap; word-break: break-all; }
+        .editable-area:focus { outline: 2px solid #007bff; border-color: transparent; }
+        .editable-area a { color: #007bff; text-decoration: underline; cursor: pointer; }
+        .hint { font-size: 0.75rem; color: #888; margin-bottom: 8px; display: block; }
+        .button-group { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+        button { background: #007bff; color: white; border: none; padding: 10px 20px; border-radius: 6px; cursor: pointer; font-weight: 600; transition: 0.2s; }
+        button:hover { background: #0056b3; }
+        button.secondary { background: #6c757d; }
+        input[type="password"] { padding: 8px; border: 1px solid #ddd; border-radius: 6px; width: 200px; }
+        .file-list { list-style: none; padding: 0; margin: 0; max-height: 300px; overflow-y: auto; }
+        .file-item { display: flex; align-items: center; gap: 12px; padding: 10px; border-bottom: 1px solid #eee; font-size: 0.9rem; }
+        .file-thumb { width: 48px; height: 48px; border-radius: 6px; object-fit: cover; background: #f0f2f5; flex-shrink: 0; display: flex; align-items: center; justify-content: center; color: #aaa; font-size: 1.5rem; }
+        .file-info { flex-grow: 1; min-width: 0; }
+        .file-name { display: block; font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .status { font-size: 0.8rem; color: #28a745; font-weight: 600; }
+        .drop-zone { border: 2px dashed #3F51B5; border-radius: 12px; padding: 30px 20px; text-align: center; color: #3F51B5; cursor: pointer; margin-bottom: 10px; transition: 0.3s; background: #f8faff; }
+        .drop-zone:hover, .drop-zone.active { background: #eef2ff; border-color: #007bff; }
+        .history-list { font-size: 0.9rem; max-height: 400px; overflow-y: auto; }
+        .history-item { display: flex; justify-content: space-between; align-items: flex-start; padding: 12px; border-radius: 8px; border-bottom: 1px solid #eee; transition: 0.2s; }
+        .history-item:hover { background: #f8faff; }
+        .history-content { flex-grow: 1; cursor: pointer; min-width: 0; }
+        .history-text { color: #333; margin-bottom: 4px; word-break: break-all; }
+        .history-time { font-size: 0.75rem; color: #999; }
+        .delete-btn { color: #ff4d4f; cursor: pointer; padding: 5px 10px; font-size: 1.2rem; opacity: 0.3; transition: 0.2s; }
+        .history-item:hover .delete-btn { opacity: 1; }
+        .error-banner { background: #fff1f0; border: 1px solid #ffa39e; color: #cf1322; padding: 15px; border-radius: 8px; margin-bottom: 20px; display: none; font-size: 0.95rem; line-height: 1.4; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div style="grid-column: 1 / -1; display: flex; align-items: baseline; gap: 15px; margin-top: 10px;">
+            <h1>K-Share</h1>
+            <span style="color: #666; font-size: 0.9rem;">Encrypted Local Sharing</span>
+            <span id="ws-status" style="font-size: 0.75rem; color: #aaa; margin-left: auto;">Offline</span>
+        </div>
+
+        <div id="secure-warning" class="error-banner">
+            ⚠️ <b>Security Alert:</b> This browser has disabled encryption features because you are using <b>HTTP</b>. 
+            Pairing and uploads will not work. <br>
+            <b>Solution:</b> Use <u>http://localhost:PORT</u> on this laptop, or use the Android app.
+        </div>
+
+        <div class="card full-width">
+            <div class="button-group">
+                <label style="font-weight: 600;">Pairing Code:</label>
+                <input type="password" id="pairing-code" placeholder="Enter code" onchange="saveCode()">
+                <span id="auth-status" style="font-size: 0.85rem; color: #666;">Enter code to unlock dashboard</span>
+            </div>
+        </div>
+
+        <div class="card full-width">
+            <h2>📋 Shared Clipboard</h2>
+            <small class="hint">💡 Click to edit. Ctrl + Click links to open.</small>
+            <div id="clipboard" class="editable-area" contenteditable="true"></div>
+            <div class="button-group">
+                <button onclick="pushClipboard()">Push to Phone</button>
+                <button class="secondary" onclick="fetchClipboard()">Fetch Latest</button>
+                <span id="clip-status" class="status"></span>
+            </div>
+        </div>
+
+        <div class="card full-width">
+            <h2>📜 Clipboard History</h2>
+            <div class="history-list" id="history-items">
+                <div style="text-align: center; color: #999; padding: 20px;">Enter pairing code to see history</div>
+            </div>
+        </div>
+
+        <div class="card">
+            <h2>📤 To Phone</h2>
+            <div id="drop-zone" class="drop-zone">
+                <b>Drag & Drop</b> files here<br>
+                <span style="font-size: 0.8rem; opacity: 0.7;">or click to browse</span>
+            </div>
+            <input type="file" id="file-input" style="display: none">
+            <ul id="tophone-list" class="file-list"></ul>
+        </div>
+
+        <div class="card">
+            <h2>📥 From Phone</h2>
+            <div style="height: 40px;"></div>
+            <ul id="fromphone-list" class="file-list"></ul>
+        </div>
+    </div>
+
+    <script>
+        const clipboardEl = document.getElementById('clipboard');
+        const codeInput = document.getElementById('pairing-code');
+        const dropZone = document.getElementById('drop-zone');
+        const fileInput = document.getElementById('file-input');
+        const warning = document.getElementById('secure-warning');
+        const authStatus = document.getElementById('auth-status');
+        const wsStatus = document.getElementById('ws-status');
+
+        const isSecure = window.isSecureContext || window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1';
+        if (!isSecure) warning.style.display = 'block';
+
+        if (localStorage.getItem('kshare_code')) {
+            codeInput.value = localStorage.getItem('kshare_code');
+        }
+
+        function saveCode() {
+            localStorage.setItem('kshare_code', codeInput.value);
+            refreshAll();
+        }
+
+        async function getCryptoKey(code) {
+            if (!window.crypto || !crypto.subtle) throw new Error("Crypto API not available");
+            const encoder = new TextEncoder();
+            const data = encoder.encode(code);
+            const hash = await crypto.subtle.digest('SHA-256', data);
+            return await crypto.subtle.importKey('raw', hash, { name: 'AES-GCM' }, false, ['encrypt', 'decrypt']);
+        }
+
+        async function decrypt(encryptedBase64) {
+            try {
+                const code = codeInput.value;
+                if (!code || !encryptedBase64) return null;
+                const key = await getCryptoKey(code);
+                const combined = Uint8Array.from(atob(encryptedBase64), c => c.charCodeAt(0));
+                const nonce = combined.slice(0, 12);
+                const ciphertext = combined.slice(12);
+                const decrypted = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: nonce }, key, ciphertext);
+                const payload = JSON.parse(new TextDecoder().decode(decrypted));
+                const bytes = Uint8Array.from(atob(payload.d), c => c.charCodeAt(0));
+                return new TextDecoder().decode(bytes);
+            } catch (e) { return null; }
+        }
+
+        async function encrypt(text) {
+            const code = codeInput.value;
+            const key = await getCryptoKey(code);
+            const nonce = crypto.getRandomValues(new Uint8Array(12));
+            const utf8Bytes = new TextEncoder().encode(text);
+            const base64Data = btoa(String.fromCharCode(...utf8Bytes));
+            const payload = { t: Math.floor(Date.now() / 1000), d: base64Data };
+            const encodedPayload = new TextEncoder().encode(JSON.stringify(payload));
+            const ciphertext = await crypto.subtle.encrypt({ name: 'AES-GCM', iv: nonce }, key, encodedPayload);
+            const combined = new Uint8Array(nonce.length + ciphertext.byteLength);
+            combined.set(nonce); combined.set(new Uint8Array(ciphertext), nonce.length);
+            return btoa(String.fromCharCode(...combined));
+        }
+
+        async function encryptStream(file, pairingCode) {
+            const key = await getCryptoKey(pairingCode);
+            const baseNonce = crypto.getRandomValues(new Uint8Array(12));
+            const chunks = [baseNonce];
+            const chunkSize = 64 * 1024;
+            let chunkIndex = 0n;
+
+            for (let offset = 0; offset < file.size; offset += chunkSize) {
+                const chunk = await file.slice(offset, offset + chunkSize).arrayBuffer();
+                const currentNonce = new Uint8Array(baseNonce);
+                for (let i = 0; i < 8; i++) {
+                    currentNonce[i] ^= Number((chunkIndex >> BigInt(i * 8)) & 0xFFn);
+                }
+                const encrypted = await crypto.subtle.encrypt({ name: 'AES-GCM', iv: currentNonce }, key, chunk);
+                const sizeBuf = new Uint8Array(4);
+                new DataView(sizeBuf.buffer).setUint32(0, encrypted.byteLength, true);
+                chunks.push(sizeBuf, new Uint8Array(encrypted));
+                chunkIndex++;
+            }
+            return new Blob(chunks);
+        }
+
+        function linkify(text) {
+            if (!text) return "";
+            const urlRegex = /(\b(https?|ftp|file):\/\/[-A-Z0-9+&@#\/%?=~_|!:,.;]*[-A-Z0-9+&@#\/%=~_|])/ig;
+            return text.replace(urlRegex, url => `<a href="${url}" target="_blank" onclick="handleLinkClick(event)">${url}</a>`);
+        }
+
+        function handleLinkClick(e) {
+            if (e.ctrlKey || e.metaKey) {
+                window.open(e.target.href, '_blank');
+                e.preventDefault();
+            }
+        }
+
+        async function fetchClipboard() {
+            if (document.activeElement === clipboardEl) return;
+            try {
+                const resp = await fetch('/clipboard');
+                const enc = await resp.text();
+                const text = await decrypt(enc);
+                if (text !== null) {
+                    if (clipboardEl.innerText !== text) clipboardEl.innerHTML = linkify(text);
+                    authStatus.innerText = "✅ Connected & Encrypted";
+                    authStatus.style.color = "#28a745";
+                }
+            } catch (e) {}
+        }
+
+        async function fetchHistory() {
+            try {
+                const resp = await fetch('/clipboard/history');
+                const enc = await resp.text();
+                const jsonStr = await decrypt(enc);
+                if (!jsonStr) return;
+                const items = JSON.parse(jsonStr);
+                const container = document.getElementById('history-items');
+                if (items.length === 0) {
+                    container.innerHTML = '<div style="text-align: center; color: #999; padding: 20px;">No history items found</div>';
+                    return;
+                }
+                container.innerHTML = items.map(item => {
+                    const safeText = btoa(new TextEncoder().encode(item.text).reduce((data, byte) => data + String.fromCharCode(byte), ''));
+                    return `
+                    <div class="history-item">
+                        <div class="history-content" onclick="restoreHistory('${safeText}')">
+                            <div class="history-text">${linkify(item.text)}</div>
+                            <div class="history-time">${new Date(item.timestamp).toLocaleString()}</div>
+                        </div>
+                        <div class="delete-btn" onclick="deleteHistory('${item.id}', event)">×</div>
+                    </div>
+                `}).join('');
+            } catch (e) {}
+        }
+
+        async function deleteHistory(id, e) {
+            if (e) e.stopPropagation();
+            if (!confirm("Delete this history item?")) return;
+            try {
+                const resp = await fetch('/clipboard/history?id=' + encodeURIComponent(id), { method: 'DELETE' });
+                if (resp.ok) fetchHistory();
+            } catch (e) { alert("Delete failed"); }
+        }
+
+        function restoreHistory(base64Text) {
+            const bytes = Uint8Array.from(atob(base64Text), c => c.charCodeAt(0));
+            const text = new TextDecoder().decode(bytes);
+            clipboardEl.innerText = text;
+            pushClipboard();
+            window.scrollTo({ top: 0, behavior: 'smooth' });
+        }
+
+        async function pushClipboard() {
+            const text = clipboardEl.innerText;
+            try {
+                const enc = await encrypt(text);
+                await fetch('/clipboard', { method: 'POST', body: enc });
+                showStatus('clip-status', 'Pushed!');
+            } catch (e) {}
+        }
+
+        async function loadFiles() {
+            loadFileList('/files/tophone', 'tophone-list', 'tophone');
+            loadFileList('/files/fromphone', 'fromphone-list', 'fromphone');
+        }
+
+        async function loadFileList(url, elementId, folder) {
+            try {
+                const resp = await fetch(url);
+                const enc = await resp.text();
+                const jsonStr = await decrypt(enc);
+                if (!jsonStr) return;
+                const files = JSON.parse(jsonStr);
+                document.getElementById(elementId).innerHTML = files.map(f => {
+                    const isImg = /\.(jpg|jpeg|png|gif|webp)$/i.test(f.name);
+                    const thumb = isImg ? `<img src="/thumbnail?folder=${folder}&name=${encodeURIComponent(f.name)}" class="file-thumb">` : `<div class="file-thumb">📄</div>`;
+                    return `
+                    <li class="file-item">
+                        ${thumb}
+                        <div class="file-info">
+                            <span class="file-name">${f.name}</span>
+                            <div style="font-size:0.75rem;color:#999">${formatSize(f.size)} • ${new Date(f.modTime).toLocaleString()}</div>
+                        </div>
+                    </li>
+                `}).join('');
+            } catch (e) {}
+        }
+
+        function formatSize(bytes) {
+            if (bytes === 0) return '0 B';
+            const k = 1024, sizes = ['B', 'KB', 'MB', 'GB'];
+            const i = Math.floor(Math.log(bytes) / Math.log(k));
+            return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + ' ' + sizes[i];
+        }
+
+        function showStatus(id, msg) {
+            const el = document.getElementById(id);
+            el.innerText = msg;
+            setTimeout(() => el.innerText = '', 3000);
+        }
+
+        function setupWebSocket() {
+            const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+            const ws = new WebSocket(`${protocol}//${window.location.host}/ws`);
+            
+            ws.onopen = () => { wsStatus.innerText = 'Online'; wsStatus.style.color = '#28a745'; };
+            ws.onclose = () => { wsStatus.innerText = 'Offline'; wsStatus.style.color = '#aaa'; setTimeout(setupWebSocket, 5000); };
+            ws.onmessage = (e) => {
+                const msg = JSON.parse(e.data);
+                if (msg.type === 'clip') fetchClipboard();
+                if (msg.type === 'history') fetchHistory();
+                if (msg.type === 'files') loadFiles();
+            };
+        }
+
+        dropZone.addEventListener('click', () => fileInput.click());
+        fileInput.addEventListener('change', () => { if (fileInput.files.length) uploadFile(fileInput.files[0]); });
+        ['dragenter', 'dragover', 'dragleave', 'drop'].forEach(evt => {
+            dropZone.addEventListener(evt, e => { e.preventDefault(); e.stopPropagation(); });
+        });
+        ['dragenter', 'dragover'].forEach(evt => dropZone.addEventListener(evt, () => dropZone.classList.add('active')));
+        ['dragleave', 'drop'].forEach(evt => dropZone.addEventListener(evt, () => dropZone.classList.remove('active')));
+        dropZone.addEventListener('drop', e => { if (e.dataTransfer.files.length) uploadFile(e.dataTransfer.files[0]); });
+
+        async function uploadFile(file) {
+            const code = codeInput.value;
+            if (!code || !isSecure) return;
+            dropZone.innerHTML = `<b>Encrypting...</b>`;
+            try {
+                const encryptedBlob = await encryptStream(file, code);
+                await fetch('/upload?folder=tophone&name=' + encodeURIComponent(file.name), { method: 'POST', body: encryptedBlob });
+                dropZone.innerHTML = `<b>✅ Done!</b>`;
+                setTimeout(() => { dropZone.innerHTML = `<b>Drag & Drop</b> files here<br><span style="font-size: 0.8rem; opacity: 0.7;">or click to browse</span>`; }, 3000);
+            } catch (e) { dropZone.innerHTML = `<b>❌ Failed</b>`; }
+        }
+
+        function refreshAll() { fetchClipboard(); fetchHistory(); loadFiles(); }
+        refreshAll();
+        setupWebSocket();
+        clipboardEl.addEventListener('blur', () => { clipboardEl.innerHTML = linkify(clipboardEl.innerText); });
+    </script>
+</body>
+</html>
