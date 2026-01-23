@@ -1,0 +1,39 @@
+# Android/Gradle
+.gradle/
+**/build/
+local.properties
+*.apk
+*.aar
+*.jks
+*.keystore
+captures/
+.externalNativeBuild/
+.cxx/
+android-app/app/google-services.json
+
+# Go
+windows-server/k-share.exe
+windows-server/*.exe
+windows-server/*.exe~
+windows-server/*.dll
+windows-server/*.so
+windows-server/*.dylib
+windows-server/*.test
+windows-server/*.out
+windows-server/config.json
+windows-server/clipboard.txt
+windows-server/clipboard_history.json
+.env
+
+# IDEs
+.idea/
+*.iml
+.vscode/
+*.swp
+*~
+.DS_Store
+
+# Misc
+*.log
+tmp/
+server_log.txt
