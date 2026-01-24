@@ -5,6 +5,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
+import android.net.Uri
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
 import android.os.Build
@@ -16,6 +17,7 @@ import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -32,7 +34,9 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Menu
 import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.filled.Add
 import androidx.compose.material3.*
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -78,6 +82,16 @@ class MainActivity : ComponentActivity() {
     private var isRefreshingState = mutableStateOf(false)
     private var showHistoryDialog = mutableStateOf(false)
     private var historyList = mutableStateOf<List<HistoryItem>>(emptyList())
+    private var themeModeState = mutableStateOf("system")
+
+    private val folderPickerLauncher = registerForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
+        uri?.let { 
+            try {
+                contentResolver.takePersistableUriPermission(it, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            } catch (e: Exception) { e.printStackTrace() }
+            uploadFolder(it) 
+        }
+    }
 
     private var lastClipboardSync = ""
     private var lastUserEditTime = 0L
@@ -89,10 +103,11 @@ class MainActivity : ComponentActivity() {
 
         serverIpState.value = settings.serverIp
         serverPortState.value = settings.serverPort.ifEmpty { "26260" }
+        themeModeState.value = settings.darkMode
 
         setContent {
-            MaterialTheme {
-                Surface(color = Color(0xFFF8F9FA), modifier = Modifier.fillMaxSize()) {
+            KShareTheme(themeMode = themeModeState.value) {
+                Surface(color = MaterialTheme.colorScheme.background, modifier = Modifier.fillMaxSize()) {
                     MainScreen()
                 }
                 if (showHistoryDialog.value) {
@@ -131,6 +146,7 @@ class MainActivity : ComponentActivity() {
         super.onResume()
         serverIpState.value = settings.serverIp
         serverPortState.value = settings.serverPort.ifEmpty { "26260" }
+        themeModeState.value = settings.darkMode
         connectWebSocket()
         startPolling()
     }
@@ -143,18 +159,46 @@ class MainActivity : ComponentActivity() {
 
     @Composable
     fun MainScreen() {
+        val isDark = when (themeModeState.value) {
+            "light" -> false
+            "dark" -> true
+            else -> isSystemInDarkTheme()
+        }
         Column(modifier = Modifier.padding(16.dp)) {
-            // Header
-            Text("K-Share", fontSize = 32.sp, fontWeight = FontWeight.Bold, color = Color(0xFF3F51B5))
-            Text("Encrypted Local Sharing", fontSize = 12.sp, color = Color.Gray, modifier = Modifier.padding(bottom = 8.dp))
-
             // Settings Card
             Card(
-                colors = CardDefaults.cardColors(containerColor = Color.White),
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
                 elevation = CardDefaults.cardElevation(2.dp),
-                modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp)
+                modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp)
             ) {
-                Column(modifier = Modifier.padding(16.dp)) {
+                Column(modifier = Modifier.padding(12.dp)) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Text("K-Share", fontSize = 18.sp, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.primary)
+                        
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Box(
+                                modifier = Modifier
+                                    .size(8.dp)
+                                    .clip(CircleShape)
+                                    .background(statusColorState.value)
+                            )
+                            Spacer(Modifier.width(12.dp))
+                            IconButton(onClick = { discoverServer() }, modifier = Modifier.size(24.dp)) {
+                                Icon(Icons.Default.Refresh, "Re-Discover", tint = MaterialTheme.colorScheme.onSurfaceVariant)
+                            }
+                            Spacer(Modifier.width(12.dp))
+                            IconButton(onClick = { startActivity(Intent(this@MainActivity, SettingsActivity::class.java)) }, modifier = Modifier.size(24.dp)) {
+                                Icon(Icons.Default.Menu, "Config", tint = MaterialTheme.colorScheme.onSurfaceVariant)
+                            }
+                        }
+                    }
+                    
+                    Spacer(modifier = Modifier.height(8.dp))
+
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         OutlinedTextField(
                             value = serverIpState.value,
@@ -163,9 +207,10 @@ class MainActivity : ComponentActivity() {
                                 settings.serverIp = it
                                 connectWebSocket()
                             },
-                            label = { Text("Server IP") },
+                            label = { Text("Server IP", fontSize = 12.sp) },
                             modifier = Modifier.weight(1f).padding(end = 8.dp),
-                            singleLine = true
+                            singleLine = true,
+                            textStyle = MaterialTheme.typography.bodyMedium
                         )
                         OutlinedTextField(
                             value = serverPortState.value,
@@ -174,52 +219,49 @@ class MainActivity : ComponentActivity() {
                                 settings.serverPort = it
                                 connectWebSocket()
                             },
-                            label = { Text("Port") },
+                            label = { Text("Port", fontSize = 12.sp) },
                             keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-                            modifier = Modifier.width(100.dp),
-                            singleLine = true
+                            modifier = Modifier.width(80.dp),
+                            singleLine = true,
+                            textStyle = MaterialTheme.typography.bodyMedium
                         )
-                    }
-                    Row(
-                        modifier = Modifier.padding(top = 8.dp).fillMaxWidth(),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.End
-                    ) {
-                        Box(
-                            modifier = Modifier
-                                .size(12.dp)
-                                .clip(CircleShape)
-                                .background(statusColorState.value)
-                        )
-                        Spacer(Modifier.width(16.dp))
-                        TextButton(onClick = { discoverServer() }) { Text("Re-Discover") }
-                        TextButton(onClick = { startActivity(Intent(this@MainActivity, SettingsActivity::class.java)) }) { Text("Config") }
                     }
                 }
             }
 
             // Clipboard Card
             Card(
-                colors = CardDefaults.cardColors(containerColor = Color.White),
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
                 elevation = CardDefaults.cardElevation(2.dp),
-                modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp)
+                modifier = Modifier.weight(1f).fillMaxWidth().padding(vertical = 4.dp)
             ) {
-                Column(modifier = Modifier.padding(16.dp)) {
-                    Text("SHARED CLIPBOARD", fontSize = 11.sp, color = Color.Gray, letterSpacing = 1.sp)
+                Column(modifier = Modifier.padding(12.dp)) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text("SHARED CLIPBOARD", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant, letterSpacing = 1.sp)
+                        Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                            TextButton(onClick = { pushClipboard() }, modifier = Modifier.height(30.dp), contentPadding = PaddingValues(horizontal = 8.dp)) { Text("Push", fontSize = 12.sp) }
+                            TextButton(onClick = { fetchClipboard() }, modifier = Modifier.height(30.dp), contentPadding = PaddingValues(horizontal = 8.dp)) { Text("Fetch", fontSize = 12.sp) }
+                            TextButton(onClick = { loadHistory() }, modifier = Modifier.height(30.dp), contentPadding = PaddingValues(horizontal = 8.dp)) { Text("History", fontSize = 12.sp) }
+                        }
+                    }
                     
                     Box(
                         modifier = Modifier
-                            .fillMaxWidth()
-                            .height(220.dp)
-                            .padding(vertical = 8.dp)
-                            .border(1.dp, Color.LightGray, RoundedCornerShape(4.dp))
+                            .fillMaxSize()
+                            .padding(top = 4.dp)
+                            .border(1.dp, MaterialTheme.colorScheme.outline, RoundedCornerShape(4.dp))
                             .padding(8.dp)
                     ) {
                         AndroidView(
                             factory = { ctx ->
                                 EditText(ctx).apply {
                                     background = null
-                                    textSize = 16f
+                                    textSize = 14f
+                                    setTextColor(if (isDark) android.graphics.Color.WHITE else android.graphics.Color.BLACK)
                                     gravity = android.view.Gravity.TOP or android.view.Gravity.START
                                     inputType = android.text.InputType.TYPE_CLASS_TEXT or android.text.InputType.TYPE_TEXT_FLAG_MULTI_LINE
                                     autoLinkMask = Linkify.WEB_URLS
@@ -239,40 +281,41 @@ class MainActivity : ComponentActivity() {
                                 if (view.text.toString() != clipboardTextState.value) {
                                     view.setText(clipboardTextState.value)
                                 }
+                                view.setTextColor(if (isDark) android.graphics.Color.WHITE else android.graphics.Color.BLACK)
                             },
                             modifier = Modifier.fillMaxSize()
                         )
-                    }
-
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        Button(onClick = { pushClipboard() }) { Text("Push") }
-                        TextButton(onClick = { fetchClipboard() }) { Text("Fetch") }
-                        TextButton(onClick = { loadHistory() }) { Text("History") }
                     }
                 }
             }
 
             // File List Card
             Card(
-                colors = CardDefaults.cardColors(containerColor = Color.White),
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
                 elevation = CardDefaults.cardElevation(2.dp),
-                modifier = Modifier.weight(1f).fillMaxWidth().padding(vertical = 8.dp)
+                modifier = Modifier.weight(1f).fillMaxWidth().padding(vertical = 4.dp)
             ) {
                 Column {
                     Row(
-                        modifier = Modifier.padding(16.dp).fillMaxWidth(),
+                        modifier = Modifier.padding(12.dp).fillMaxWidth(),
                         horizontalArrangement = Arrangement.SpaceBetween,
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Text("Files", fontWeight = FontWeight.Bold)
-                        IconButton(onClick = { refreshFileList() }) {
-                            Icon(Icons.Default.Refresh, "Refresh")
+                        Text("Files", fontWeight = FontWeight.Bold, fontSize = 16.sp)
+                        Row {
+                            IconButton(onClick = { folderPickerLauncher.launch(null) }, modifier = Modifier.size(24.dp)) {
+                                Icon(Icons.Default.Add, "Upload Folder", tint = MaterialTheme.colorScheme.primary)
+                            }
+                            Spacer(Modifier.width(16.dp))
+                            IconButton(onClick = { refreshFileList() }, modifier = Modifier.size(24.dp)) {
+                                Icon(Icons.Default.Refresh, "Refresh")
+                            }
                         }
                     }
                     if (isRefreshingState.value) {
                         LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
                     }
-                    LazyColumn {
+                    LazyColumn(modifier = Modifier.padding(horizontal = 4.dp)) {
                         items(fileListState.value) { file ->
                             FileItem(file)
                         }
@@ -287,7 +330,7 @@ class MainActivity : ComponentActivity() {
         var thumbnail by remember { mutableStateOf<Bitmap?>(null) }
         
         LaunchedEffect(file.name) {
-            if (file.name.lowercase().let { it.endsWith(".jpg") || it.endsWith(".png") }) {
+            if (!file.isDir && file.name.lowercase().let { it.endsWith(".jpg") || it.endsWith(".png") }) {
                 val url = ApiClient.getThumbnailUrl(serverIpState.value, serverPortState.value.toIntOrNull()?:0, "tophone", file.name)
                 val key = "${serverIpState.value}_${file.name}"
                 val cached = ThumbnailCache.getFromMemory(key)
@@ -305,22 +348,30 @@ class MainActivity : ComponentActivity() {
                 .padding(12.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
-            if (thumbnail != null) {
+            if (file.isDir) {
+                Icon(
+                    painter = painterResource(android.R.drawable.ic_menu_directions), 
+                    contentDescription = null,
+                    modifier = Modifier.size(48.dp).padding(8.dp),
+                    tint = Color(0xFFFFC107)
+                )
+            } else if (thumbnail != null) {
                 Image(
                     bitmap = thumbnail!!.asImageBitmap(),
                     contentDescription = null,
-                    modifier = Modifier.size(48.dp).background(Color.LightGray)
+                    modifier = Modifier.size(48.dp).background(MaterialTheme.colorScheme.surfaceVariant)
                 )
             } else {
                 Icon(
                     painter = painterResource(android.R.drawable.ic_menu_save),
                     contentDescription = null,
-                    modifier = Modifier.size(48.dp).padding(8.dp)
+                    modifier = Modifier.size(48.dp).padding(8.dp),
+                    tint = MaterialTheme.colorScheme.primary
                 )
             }
             Column(modifier = Modifier.padding(start = 12.dp).weight(1f)) {
-                Text(file.name, fontWeight = FontWeight.Bold, maxLines = 1)
-                Text("${file.size / 1024} KB • ${file.modTime}", fontSize = 12.sp, color = Color.Gray)
+                Text(file.name, fontWeight = FontWeight.Bold, maxLines = 1, color = MaterialTheme.colorScheme.onSurface)
+                Text(if (file.isDir) "Folder • ${file.modTime}" else "${file.size / 1024} KB • ${file.modTime}", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
         }
     }
@@ -332,13 +383,18 @@ class MainActivity : ComponentActivity() {
         onSelect: (HistoryItem) -> Unit,
         onDelete: (HistoryItem) -> Unit
     ) {
+        val isDark = when (themeModeState.value) {
+            "light" -> false
+            "dark" -> true
+            else -> isSystemInDarkTheme()
+        }
         Dialog(onDismissRequest = onDismiss) {
             Card(
-                colors = CardDefaults.cardColors(containerColor = Color.White),
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
                 modifier = Modifier.fillMaxWidth(0.95f).heightIn(max = 500.dp)
             ) {
                 Column(modifier = Modifier.padding(16.dp)) {
-                    Text("History", style = MaterialTheme.typography.titleLarge)
+                    Text("History", style = MaterialTheme.typography.titleLarge, color = MaterialTheme.colorScheme.onSurface)
                     Spacer(Modifier.height(16.dp))
                     LazyColumn {
                         items(items) { item ->
@@ -353,7 +409,7 @@ class MainActivity : ComponentActivity() {
                                     factory = { ctx ->
                                         TextView(ctx).apply {
                                             textSize = 16f
-                                            setTextColor(android.graphics.Color.BLACK)
+                                            setTextColor(if (isDark) android.graphics.Color.WHITE else android.graphics.Color.BLACK)
                                             autoLinkMask = Linkify.WEB_URLS
                                             linksClickable = true
                                             movementMethod = android.text.method.LinkMovementMethod.getInstance()
@@ -361,14 +417,15 @@ class MainActivity : ComponentActivity() {
                                     },
                                     update = { view ->
                                         view.text = item.text
+                                        view.setTextColor(if (isDark) android.graphics.Color.WHITE else android.graphics.Color.BLACK)
                                     },
                                     modifier = Modifier.weight(1f)
                                 )
                                 IconButton(onClick = { onDelete(item) }) {
-                                    Icon(Icons.Default.Delete, "Delete")
+                                    Icon(Icons.Default.Delete, "Delete", tint = MaterialTheme.colorScheme.error)
                                 }
                             }
-                            HorizontalDivider()
+                            HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
                         }
                     }
                     Button(onClick = onDismiss, modifier = Modifier.fillMaxWidth().padding(top = 16.dp)) {
@@ -522,6 +579,18 @@ class MainActivity : ComponentActivity() {
         val intent = Intent(this, FileTransferService::class.java).apply {
             action = FileTransferService.ACTION_DOWNLOAD
             putExtra(FileTransferService.EXTRA_FILE_NAME, file.name)
+            putExtra(FileTransferService.EXTRA_IS_DIR, file.isDir)
+            putExtra(FileTransferService.EXTRA_SERVER_IP, serverIpState.value)
+            putExtra(FileTransferService.EXTRA_SERVER_PORT, serverPortState.value.toIntOrNull() ?: 26260)
+            putExtra(FileTransferService.EXTRA_PAIRING_CODE, settings.pairingCode)
+        }
+        startForegroundService(intent)
+    }
+
+    private fun uploadFolder(treeUri: Uri) {
+        val intent = Intent(this, FileTransferService::class.java).apply {
+            action = FileTransferService.ACTION_UPLOAD_FOLDER
+            putExtra(FileTransferService.EXTRA_TREE_URI, treeUri.toString())
             putExtra(FileTransferService.EXTRA_SERVER_IP, serverIpState.value)
             putExtra(FileTransferService.EXTRA_SERVER_PORT, serverPortState.value.toIntOrNull() ?: 26260)
             putExtra(FileTransferService.EXTRA_PAIRING_CODE, settings.pairingCode)

@@ -25,31 +25,34 @@ class ShareActivity : ComponentActivity() {
         val sharedText = intent?.getStringExtra(Intent.EXTRA_TEXT)
         
         if (intent?.action == Intent.ACTION_SEND && sharedText != null) {
+            val settings = SettingsManager(this)
             setContent {
-                val openDialog = remember { mutableStateOf(true) }
-                if (openDialog.value) {
-                    val displayPreview = if (sharedText.length > 100) sharedText.take(100) + "..." else sharedText
-                    
-                    AlertDialog(
-                        onDismissRequest = { finish() },
-                        title = { Text("K-Share Sync") },
-                        text = { Text(displayPreview) },
-                        confirmButton = {
-                            if (sharedText.startsWith("http") || sharedText.contains("www.")) {
-                                TextButton(onClick = { openOnPc(sharedText); openDialog.value = false }) {
-                                    Text("Open on PC")
+                KShareTheme(themeMode = settings.darkMode) {
+                    val openDialog = remember { mutableStateOf(true) }
+                    if (openDialog.value) {
+                        val displayPreview = if (sharedText.length > 100) sharedText.take(100) + "..." else sharedText
+                        
+                        AlertDialog(
+                            onDismissRequest = { finish() },
+                            title = { Text("K-Share Sync") },
+                            text = { Text(displayPreview) },
+                            confirmButton = {
+                                if (sharedText.startsWith("http") || sharedText.contains("www.")) {
+                                    TextButton(onClick = { openOnPc(sharedText); openDialog.value = false }) {
+                                        Text("Open on PC")
+                                    }
+                                }
+                                TextButton(onClick = { pushToClipboard(sharedText); openDialog.value = false }) {
+                                    Text("Sync Clipboard")
+                                }
+                            },
+                            dismissButton = {
+                                TextButton(onClick = { finish() }) {
+                                    Text("Cancel")
                                 }
                             }
-                            TextButton(onClick = { pushToClipboard(sharedText); openDialog.value = false }) {
-                                Text("Sync Clipboard")
-                            }
-                        },
-                        dismissButton = {
-                            TextButton(onClick = { finish() }) {
-                                Text("Cancel")
-                            }
-                        }
-                    )
+                        )
+                    }
                 }
             }
         } else {

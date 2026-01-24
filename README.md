@@ -11,10 +11,17 @@ A high-performance, professional-grade alternative to cloud sharing. **K-Share**
 * **Rich Link Support:** URLs in the clipboard and history are automatically detected and clickable on both Android and the Web Dashboard.
 * **History:** Securely stores the last 20 snippets with selective deletion support.
 
-### 📂 **Seamless File Transfer**
-* **Drag & Drop:** Drop files directly into your browser to send them to your phone.
+### 📂 **Seamless File & Folder Transfer**
+* **Folder Support:** Transfer entire directory structures. The PC server zips folders on-the-fly, and the Android app automatically decrypts and unzips them, preserving your nested file hierarchy.
+* **Recursive Uploads:** Pick an entire folder from your Android device to sync to your PC in one tap.
+* **No-Overwrite Protection:** Automatic versioning (e.g., `document (1).pdf`) ensures you never lose a file by mistake.
+* **Drag & Drop:** Drop files or entire folders directly into your browser to send them to your phone.
 * **Smart Previews:** High-performance thumbnail generation for images with dual-layer (Memory + Disk) caching on Android.
-* **WiFi-Aware:** Android transfers only occur on WiFi. 
+
+### 🌓 **Modern UI/UX**
+* **Full Dark Mode:** Both the Android app and Web Dashboard support system-aware and manual dark mode toggles.
+* **Custom Storage:** Choose any location on your Android device (Internal storage, SD card, or specific subdirectories) as your persistent download folder.
+* **Optimized Layout:** Compact Android interface prioritizing shared space between your clipboard and file list.
 
 ### 🔐 **Security-First Design**
 * **AES-256-GCM:** All data (clipboard, file lists, and files) is wrapped in secured encryption.
@@ -119,7 +126,7 @@ Edit `config.json` in the `windows-server` folder:
 
 * **Backend:** Go (Gorilla WebSockets, Systray, Resize Library).
 * **Web:** Vanilla JavaScript, Web Crypto API (SubtleCrypto).
-* **Mobile:** Kotlin, Jetpack Compose, WorkManager, OkHttp, LruCache.
+* **Mobile:** Kotlin, Jetpack Compose, WorkManager, OkHttp, LruCache, DocumentFile (SAF).
 * **Discovery:** Automated discovery via GitHub Gists (fallback to manual IP).
 
 ---

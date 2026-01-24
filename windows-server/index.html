@@ -6,47 +6,98 @@
     <title>K-Share Web Terminal</title>
     <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><rect width=%22100%22 height=%22100%22 rx=%2220%22 fill=%22%233F51B5%22/><path d=%22M30 25 v50 M30 50 l30 -25 M30 50 l30 25%22 stroke=%22white%22 stroke-width=%228%22 stroke-linecap=%22round%22/></svg>">
     <style>
-        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #f0f2f5; margin: 0; padding: 20px; color: #333; }
+        :root {
+            --bg-color: #f0f2f5;
+            --card-bg: white;
+            --text-color: #333;
+            --text-secondary: #666;
+            --border-color: #eee;
+            --input-border: #ddd;
+            --primary-color: #3F51B5;
+            --primary-hover: #303F9F;
+            --shadow: rgba(0,0,0,0.05);
+            --hint-color: #888;
+            --status-ok: #28a745;
+            --error-bg: #fff1f0;
+            --error-border: #ffa39e;
+            --error-text: #cf1322;
+            --link-color: #3F51B5;
+        }
+
+        [data-theme="dark"] {
+            --bg-color: #121212;
+            --card-bg: #1e1e1e;
+            --text-color: #e0e0e0;
+            --text-secondary: #aaa;
+            --border-color: #333;
+            --input-border: #444;
+            --primary-color: #7986CB;
+            --primary-hover: #9FA8DA;
+            --shadow: rgba(0,0,0,0.3);
+            --hint-color: #777;
+            --status-ok: #81c784;
+            --error-bg: #2a1211;
+            --error-border: #5c2220;
+            --error-text: #ff7875;
+            --link-color: #9FA8DA;
+        }
+
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: var(--bg-color); margin: 0; padding: 20px; color: var(--text-color); transition: background 0.3s, color 0.3s; }
         .container { max-width: 1000px; margin: 0 auto; display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
-        .card { background: white; border-radius: 12px; padding: 20px; box-shadow: 0 4px 6px rgba(0,0,0,0.05); }
+        .card { background: var(--card-bg); border-radius: 12px; padding: 20px; box-shadow: 0 4px 6px var(--shadow); transition: background 0.3s, box-shadow 0.3s; }
         .full-width { grid-column: 1 / -1; }
-        h1 { color: #3F51B5; margin: 0; font-size: 2.2rem; }
-        h2 { margin-top: 0; font-size: 1.1rem; border-bottom: 2px solid #eee; padding-bottom: 10px; color: #555; }
-        .editable-area { width: 100%; height: 150px; border: 1px solid #ddd; border-radius: 8px; padding: 12px; box-sizing: border-box; font-family: inherit; font-size: 1rem; margin-bottom: 10px; resize: vertical; overflow-y: auto; background: white; white-space: pre-wrap; word-break: break-all; }
-        .editable-area:focus { outline: 2px solid #007bff; border-color: transparent; }
-        .editable-area a { color: #007bff; text-decoration: underline; cursor: pointer; }
-        .hint { font-size: 0.75rem; color: #888; margin-bottom: 8px; display: block; }
+        h1 { color: var(--primary-color); margin: 0; font-size: 1.8rem; }
+        h2 { margin-top: 0; font-size: 1.1rem; border-bottom: 2px solid var(--border-color); padding-bottom: 10px; color: var(--text-secondary); }
+        .editable-area { width: 100%; height: 150px; border: 1px solid var(--input-border); border-radius: 8px; padding: 12px; box-sizing: border-box; font-family: inherit; font-size: 1rem; margin-bottom: 10px; resize: vertical; overflow-y: auto; background: var(--card-bg); color: var(--text-color); white-space: pre-wrap; word-break: break-all; }
+        .editable-area:focus { outline: 2px solid var(--primary-color); border-color: transparent; }
+        .editable-area a { color: var(--link-color); text-decoration: underline; cursor: pointer; }
+        .hint { font-size: 0.75rem; color: var(--hint-color); margin-bottom: 8px; display: block; }
         .button-group { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
-        button { background: #007bff; color: white; border: none; padding: 10px 20px; border-radius: 6px; cursor: pointer; font-weight: 600; transition: 0.2s; }
-        button:hover { background: #0056b3; }
+        button { background: var(--primary-color); color: white; border: none; padding: 10px 20px; border-radius: 6px; cursor: pointer; font-weight: 600; transition: 0.2s; }
+        button:hover { background: var(--primary-hover); }
         button.secondary { background: #6c757d; }
-        input[type="password"] { padding: 8px; border: 1px solid #ddd; border-radius: 6px; width: 200px; }
+        input[type="password"] { padding: 8px; border: 1px solid var(--input-border); border-radius: 6px; width: 120px; background: var(--card-bg); color: var(--text-color); }
         .file-list { list-style: none; padding: 0; margin: 0; max-height: 300px; overflow-y: auto; }
-        .file-item { display: flex; align-items: center; gap: 12px; padding: 10px; border-bottom: 1px solid #eee; font-size: 0.9rem; }
-        .file-thumb { width: 48px; height: 48px; border-radius: 6px; object-fit: cover; background: #f0f2f5; flex-shrink: 0; display: flex; align-items: center; justify-content: center; color: #aaa; font-size: 1.5rem; }
+        .file-item { display: flex; align-items: center; gap: 12px; padding: 10px; border-bottom: 1px solid var(--border-color); font-size: 0.9rem; }
+        .file-thumb { width: 48px; height: 48px; border-radius: 6px; object-fit: cover; background: var(--bg-color); flex-shrink: 0; display: flex; align-items: center; justify-content: center; color: var(--hint-color); font-size: 1.5rem; }
         .file-info { flex-grow: 1; min-width: 0; }
-        .file-name { display: block; font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-        .status { font-size: 0.8rem; color: #28a745; font-weight: 600; }
-        .drop-zone { border: 2px dashed #3F51B5; border-radius: 12px; padding: 30px 20px; text-align: center; color: #3F51B5; cursor: pointer; margin-bottom: 10px; transition: 0.3s; background: #f8faff; }
-        .drop-zone:hover, .drop-zone.active { background: #eef2ff; border-color: #007bff; }
+        .file-name { display: block; font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-color); }
+        .status { font-size: 0.8rem; color: var(--status-ok); font-weight: 600; }
+        .drop-zone { border: 2px dashed var(--primary-color); border-radius: 12px; padding: 30px 20px; text-align: center; color: var(--primary-color); cursor: pointer; margin-bottom: 10px; transition: 0.3s; background: var(--bg-color); opacity: 0.8; }
+        .drop-zone:hover, .drop-zone.active { opacity: 1; background: var(--shadow); border-color: var(--primary-color); }
         .history-list { font-size: 0.9rem; max-height: 400px; overflow-y: auto; }
-        .history-item { display: flex; justify-content: space-between; align-items: flex-start; padding: 12px; border-radius: 8px; border-bottom: 1px solid #eee; transition: 0.2s; }
-        .history-item:hover { background: #f8faff; }
+        .history-item { display: flex; justify-content: space-between; align-items: flex-start; padding: 12px; border-radius: 8px; border-bottom: 1px solid var(--border-color); transition: 0.2s; }
+        .history-item:hover { background: var(--shadow); }
         .history-content { flex-grow: 1; cursor: pointer; min-width: 0; }
-        .history-text { color: #333; margin-bottom: 4px; word-break: break-all; }
-        .history-time { font-size: 0.75rem; color: #999; }
+        .history-text { color: var(--text-color); margin-bottom: 4px; word-break: break-all; }
+        .history-time { font-size: 0.75rem; color: var(--hint-color); }
         .delete-btn { color: #ff4d4f; cursor: pointer; padding: 5px 10px; font-size: 1.2rem; opacity: 0.3; transition: 0.2s; }
         .history-item:hover .delete-btn { opacity: 1; }
-        .error-banner { background: #fff1f0; border: 1px solid #ffa39e; color: #cf1322; padding: 15px; border-radius: 8px; margin-bottom: 20px; display: none; font-size: 0.95rem; line-height: 1.4; }
+        .error-banner { background: var(--error-bg); border: 1px solid var(--error-border); color: var(--error-text); padding: 15px; border-radius: 8px; margin-bottom: 20px; display: none; font-size: 0.95rem; line-height: 1.4; }
+        
+        header { grid-column: 1 / -1; display: flex; align-items: center; justify-content: space-between; padding: 10px 0; margin-bottom: 10px; flex-wrap: wrap; gap: 10px; }
+        .header-left { display: flex; align-items: baseline; gap: 15px; }
+        .header-right { display: flex; align-items: center; gap: 15px; }
+        .theme-toggle { background: none; border: 1px solid var(--input-border); color: var(--text-color); padding: 5px 10px; border-radius: 20px; font-size: 0.8rem; cursor: pointer; }
+        .theme-toggle:hover { background: var(--shadow); }
     </style>
 </head>
 <body>
     <div class="container">
-        <div style="grid-column: 1 / -1; display: flex; align-items: baseline; gap: 15px; margin-top: 10px;">
-            <h1>K-Share</h1>
-            <span style="color: #666; font-size: 0.9rem;">Encrypted Local Sharing</span>
-            <span id="ws-status" style="font-size: 0.75rem; color: #aaa; margin-left: auto;">Offline</span>
-        </div>
+        <header>
+            <div class="header-left">
+                <h1>K-Share</h1>
+                <span style="color: var(--text-secondary); font-size: 0.9rem;">Encrypted Local Sharing</span>
+                <span id="ws-status" style="font-size: 0.75rem; color: var(--hint-color);">Offline</span>
+            </div>
+            <div class="header-right">
+                <div style="display: flex; align-items: center; gap: 8px;">
+                    <label style="font-size: 0.85rem; font-weight: 600;">Code:</label>
+                    <input type="password" id="pairing-code" placeholder="Pin" onchange="saveCode()" style="width: 80px;">
+                </div>
+                <button class="theme-toggle" id="theme-toggle" onclick="toggleTheme()">🌙</button>
+            </div>
+        </header>
 
         <div id="secure-warning" class="error-banner">
             ⚠️ <b>Security Alert:</b> This browser has disabled encryption features because you are using <b>HTTP</b>. 
@@ -54,12 +105,8 @@
             <b>Solution:</b> Use <u>http://localhost:PORT</u> on this laptop, or use the Android app.
         </div>
 
-        <div class="card full-width">
-            <div class="button-group">
-                <label style="font-weight: 600;">Pairing Code:</label>
-                <input type="password" id="pairing-code" placeholder="Enter code" onchange="saveCode()">
-                <span id="auth-status" style="font-size: 0.85rem; color: #666;">Enter code to unlock dashboard</span>
-            </div>
+        <div class="card full-width" id="dashboard-status-card" style="padding: 10px 20px;">
+            <span id="auth-status" style="font-size: 0.85rem; color: var(--text-secondary);">Enter code to unlock dashboard</span>
         </div>
 
         <div class="card full-width">
@@ -83,10 +130,12 @@
         <div class="card">
             <h2>📤 To Phone</h2>
             <div id="drop-zone" class="drop-zone">
-                <b>Drag & Drop</b> files here<br>
+                <b>Drag & Drop</b> files or folders here<br>
                 <span style="font-size: 0.8rem; opacity: 0.7;">or click to browse</span>
             </div>
-            <input type="file" id="file-input" style="display: none">
+            <input type="file" id="file-input" multiple style="display: none">
+            <input type="file" id="folder-input" webkitdirectory directory style="display: none">
+            <button onclick="document.getElementById('folder-input').click()" style="width: 100%; margin-bottom: 10px; background: #6c757d;">📁 Upload Folder</button>
             <ul id="tophone-list" class="file-list"></ul>
         </div>
 
@@ -112,6 +161,19 @@
         if (localStorage.getItem('kshare_code')) {
             codeInput.value = localStorage.getItem('kshare_code');
         }
+
+        // Theme Management
+        function toggleTheme() {
+            const current = document.documentElement.getAttribute('data-theme');
+            const target = current === 'dark' ? 'light' : 'dark';
+            document.documentElement.setAttribute('data-theme', target);
+            localStorage.setItem('kshare_theme', target);
+            document.getElementById('theme-toggle').innerText = target === 'dark' ? '☀️' : '🌙';
+        }
+
+        const savedTheme = localStorage.getItem('kshare_theme') || (window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
+        document.documentElement.setAttribute('data-theme', savedTheme);
+        document.getElementById('theme-toggle').innerText = savedTheme === 'dark' ? '☀️' : '🌙';
 
         function saveCode() {
             localStorage.setItem('kshare_code', codeInput.value);
@@ -270,17 +332,30 @@
                 const files = JSON.parse(jsonStr);
                 document.getElementById(elementId).innerHTML = files.map(f => {
                     const isImg = /\.(jpg|jpeg|png|gif|webp)$/i.test(f.name);
-                    const thumb = isImg ? `<img src="/thumbnail?folder=${folder}&name=${encodeURIComponent(f.name)}" class="file-thumb">` : `<div class="file-thumb">📄</div>`;
+                    const isDir = f.isDirectory;
+                    let thumb = "";
+                    if (isDir) {
+                        thumb = `<div class="file-thumb" style="color: #FFC107">📁</div>`;
+                    } else if (isImg) {
+                        thumb = `<img src="/thumbnail?folder=${folder}&name=${encodeURIComponent(f.name)}" class="file-thumb">`;
+                    } else {
+                        thumb = `<div class="file-thumb">📄</div>`;
+                    }
+                    
                     return `
-                    <li class="file-item">
+                    <li class="file-item" style="cursor: pointer" onclick="downloadFile('${encodeURIComponent(f.name)}', '${folder}')">
                         ${thumb}
                         <div class="file-info">
                             <span class="file-name">${f.name}</span>
-                            <div style="font-size:0.75rem;color:#999">${formatSize(f.size)} • ${new Date(f.modTime).toLocaleString()}</div>
+                            <div style="font-size:0.75rem;color:#999">${isDir ? 'Folder' : formatSize(f.size)} • ${new Date(f.modTime).toLocaleString()}</div>
                         </div>
                     </li>
                 `}).join('');
             } catch (e) {}
+        }
+
+        async function downloadFile(name, folder) {
+            window.location.href = `/download/${name}?folder=${folder}`;
         }
 
         function formatSize(bytes) {
@@ -310,25 +385,72 @@
             };
         }
 
+        const folderInput = document.getElementById('folder-input');
+
         dropZone.addEventListener('click', () => fileInput.click());
-        fileInput.addEventListener('change', () => { if (fileInput.files.length) uploadFile(fileInput.files[0]); });
+        fileInput.addEventListener('change', () => { if (fileInput.files.length) uploadMultiple(fileInput.files); });
+        folderInput.addEventListener('change', () => { if (folderInput.files.length) uploadMultiple(folderInput.files); });
+        
         ['dragenter', 'dragover', 'dragleave', 'drop'].forEach(evt => {
             dropZone.addEventListener(evt, e => { e.preventDefault(); e.stopPropagation(); });
         });
         ['dragenter', 'dragover'].forEach(evt => dropZone.addEventListener(evt, () => dropZone.classList.add('active')));
         ['dragleave', 'drop'].forEach(evt => dropZone.addEventListener(evt, () => dropZone.classList.remove('active')));
-        dropZone.addEventListener('drop', e => { if (e.dataTransfer.files.length) uploadFile(e.dataTransfer.files[0]); });
+        
+        dropZone.addEventListener('drop', async e => { 
+            const items = e.dataTransfer.items;
+            if (items) {
+                const files = [];
+                for (let i = 0; i < items.length; i++) {
+                    const item = items[i].webkitGetAsEntry();
+                    if (item) {
+                        await getFilesFromEntry(item, files);
+                    }
+                }
+                uploadMultiple(files);
+            } else {
+                uploadMultiple(e.dataTransfer.files);
+            }
+        });
 
-        async function uploadFile(file) {
+        async function getFilesFromEntry(entry, fileList, path = "") {
+            if (entry.isFile) {
+                const file = await new Promise(resolve => entry.file(resolve));
+                // Store relative path for directory preservation
+                file.relativePath = path + entry.name;
+                fileList.push(file);
+            } else if (entry.isDirectory) {
+                const reader = entry.createReader();
+                const entries = await new Promise(resolve => reader.readEntries(resolve));
+                for (const child of entries) {
+                    await getFilesFromEntry(child, fileList, path + entry.name + "/");
+                }
+            }
+        }
+
+        async function uploadMultiple(files) {
             const code = codeInput.value;
             if (!code || !isSecure) return;
-            dropZone.innerHTML = `<b>Encrypting...</b>`;
-            try {
-                const encryptedBlob = await encryptStream(file, code);
-                await fetch('/upload?folder=tophone&name=' + encodeURIComponent(file.name), { method: 'POST', body: encryptedBlob });
-                dropZone.innerHTML = `<b>✅ Done!</b>`;
-                setTimeout(() => { dropZone.innerHTML = `<b>Drag & Drop</b> files here<br><span style="font-size: 0.8rem; opacity: 0.7;">or click to browse</span>`; }, 3000);
-            } catch (e) { dropZone.innerHTML = `<b>❌ Failed</b>`; }
+            
+            let successCount = 0;
+            const total = files.length;
+            
+            for (let i = 0; i < total; i++) {
+                const file = files[i];
+                const name = file.relativePath || file.name;
+                dropZone.innerHTML = `<b>Uploading ${i+1}/${total}:</b><br>${file.name}`;
+                try {
+                    const encryptedBlob = await encryptStream(file, code);
+                    await fetch('/upload?folder=tophone&name=' + encodeURIComponent(name), { method: 'POST', body: encryptedBlob });
+                    successCount++;
+                } catch (e) {
+                    console.error("Upload failed for " + name, e);
+                }
+            }
+            
+            dropZone.innerHTML = `<b>✅ Done!</b><br>Uploaded ${successCount}/${total} items`;
+            setTimeout(() => { dropZone.innerHTML = `<b>Drag & Drop</b> files or folders here<br><span style="font-size: 0.8rem; opacity: 0.7;">or click to browse</span>`; }, 3000);
+            loadFiles();
         }
 
         function refreshAll() { fetchClipboard(); fetchHistory(); loadFiles(); }

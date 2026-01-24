@@ -1,6 +1,7 @@
 package main
 
 import (
+	"archive/zip"
 	"bytes"
 	"crypto/aes"
 	"crypto/cipher"
@@ -42,9 +43,10 @@ type Config struct {
 }
 
 type FileInfo struct {
-	Name    string    `json:"name"`
-	Size    int64     `json:"size"`
-	ModTime time.Time `json:"modTime"`
+	Name        string `json:"name"`
+	IsDirectory bool   `json:"isDirectory"`
+	Size        int64  `json:"size"`
+	ModTime     string `json:"modTime"`
 }
 
 type HistoryItem struct {
@@ -315,6 +317,13 @@ func handleUpload(w http.ResponseWriter, r *http.Request) {
 		dir = appConfig.ToPhone
 	}
 	destPath := filepath.Join(dir, filename)
+
+	// Create parent directories if they don't exist
+	if err := os.MkdirAll(filepath.Dir(destPath), 0755); err != nil {
+		http.Error(w, "Failed to create directory", http.StatusInternalServerError)
+		return
+	}
+
 	destFile, err := os.Create(destPath)
 	if err != nil {
 		http.Error(w, "Save failed", http.StatusInternalServerError)
@@ -333,17 +342,32 @@ func handleUpload(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleListFiles(w http.ResponseWriter, r *http.Request, dir string) {
-	entries, _ := os.ReadDir(dir)
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		log.Printf("❌ Failed to read directory %s: %v\n", dir, err)
+		entries = []os.DirEntry{}
+	}
+
 	var files []FileInfo
 	for _, entry := range entries {
-		if entry.IsDir() {
+		info, err := entry.Info()
+		if err != nil {
 			continue
 		}
-		info, _ := entry.Info()
-		files = append(files, FileInfo{Name: info.Name(), Size: info.Size(), ModTime: info.ModTime()})
+		files = append(files, FileInfo{
+			Name:        info.Name(),
+			IsDirectory: info.IsDir(),
+			Size:        info.Size(),
+			ModTime:     info.ModTime().Format("2006-01-02 15:04:05"),
+		})
 	}
+	log.Printf("📂 Listing %d items from %s\n", len(files), dir)
 	data, _ := json.Marshal(files)
-	enc, _ := encryptData(data)
+	enc, err := encryptData(data)
+	if err != nil {
+		http.Error(w, "Encryption failed", http.StatusInternalServerError)
+		return
+	}
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Write([]byte(enc))
 }
@@ -649,20 +673,70 @@ func main() {
 	mux.HandleFunc("/files/tophone", func(w http.ResponseWriter, r *http.Request) { handleListFiles(w, r, appConfig.ToPhone) })
 	mux.HandleFunc("/files/fromphone", func(w http.ResponseWriter, r *http.Request) { handleListFiles(w, r, appConfig.FromPhone) })
 	mux.HandleFunc("/download/", func(w http.ResponseWriter, r *http.Request) {
-		filename := filepath.Base(r.URL.Path)
+		path := r.URL.Path
+		filename := filepath.Base(path)
+
 		dir := appConfig.ToPhone
 		if r.URL.Query().Get("folder") == "fromphone" {
 			dir = appConfig.FromPhone
 		}
-		file, err := os.Open(filepath.Join(dir, filename))
+		fullPath := filepath.Join(dir, filename)
+		info, err := os.Stat(fullPath)
 		if err != nil {
+			log.Printf("❌ Download failed: %s not found in %s\n", filename, dir)
 			http.Error(w, "File not found", http.StatusNotFound)
 			return
 		}
-		defer file.Close()
-		w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s.enc\"", filename))
-		log.Printf("📤 Sending Encrypted: %s\n", filename)
-		encryptStream(w, file)
+
+		if info.IsDir() {
+			pr, pw := io.Pipe()
+			go func() {
+				defer pw.Close()
+				zw := zip.NewWriter(pw)
+				defer zw.Close()
+				filepath.Walk(fullPath, func(path string, info os.FileInfo, err error) error {
+					if err != nil {
+						return err
+					}
+					relPath, _ := filepath.Rel(fullPath, path)
+					if relPath == "." {
+						return nil
+					}
+					// Standardize slashes for ZIP entries (Android expects forward slashes)
+					relPath = filepath.ToSlash(relPath)
+
+					if info.IsDir() {
+						_, err := zw.Create(relPath + "/")
+						return err
+					}
+
+					f, err := os.Open(path)
+					if err != nil {
+						return err
+					}
+					defer f.Close()
+					w, err := zw.Create(relPath)
+					if err != nil {
+						return err
+					}
+					_, err = io.Copy(w, f)
+					return err
+				})
+			}()
+			w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s.zip.enc\"", filename))
+			log.Printf("📤 Sending Encrypted Folder (as Zip): %s\n", filename)
+			encryptStream(w, pr)
+		} else {
+			file, err := os.Open(fullPath)
+			if err != nil {
+				http.Error(w, "File not found", http.StatusNotFound)
+				return
+			}
+			defer file.Close()
+			w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s.enc\"", filename))
+			log.Printf("📤 Sending Encrypted File: %s\n", filename)
+			encryptStream(w, file)
+		}
 	})
 	mux.HandleFunc("/clipboard", handleClipboard)
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {

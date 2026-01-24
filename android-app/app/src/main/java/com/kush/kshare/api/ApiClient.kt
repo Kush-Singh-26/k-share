@@ -2,6 +2,7 @@ package com.kush.kshare.api
 
 import android.util.Base64
 import com.google.gson.Gson
+import com.google.gson.annotations.SerializedName
 import com.google.gson.reflect.TypeToken
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -22,6 +23,7 @@ import javax.crypto.spec.SecretKeySpec
 
 data class RemoteFile(
     val name: String,
+    @SerializedName("isDirectory") val isDir: Boolean = false,
     val size: Long,
     val modTime: String
 )
@@ -263,7 +265,8 @@ object ApiClient {
         pairingCode: String,
         onStreamReady: suspend (InputStream, Long) -> Unit
     ): Boolean {
-        val request = Request.Builder().url("http://$serverIp:$port/download/$fileName").build()
+        val encodedName = java.net.URLEncoder.encode(fileName, "UTF-8").replace("+", "%20")
+        val request = Request.Builder().url("http://$serverIp:$port/download/$encodedName").build()
         return try {
             withContext(Dispatchers.IO) {
                 client.newCall(request).execute().use { response ->
@@ -293,7 +296,8 @@ object ApiClient {
                 }
             }
         }
-        val request = Request.Builder().url("http://$serverIp:$port/upload?name=$fileName").post(requestBody).build()
+        val encodedName = java.net.URLEncoder.encode(fileName, "UTF-8")
+        val request = Request.Builder().url("http://$serverIp:$port/upload?name=$encodedName").post(requestBody).build()
         return try {
             withContext(Dispatchers.IO) {
                 client.newCall(request).execute().use { it.isSuccessful }

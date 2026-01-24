@@ -24,4 +24,12 @@ class SettingsManager(context: Context) {
     var gistJsonKey: String
         get() = prefs.getString("gist_json_key", "ip") ?: "ip"
         set(value) = prefs.edit().putString("gist_json_key", value).apply()
+
+    var darkMode: String
+        get() = prefs.getString("dark_mode", "system") ?: "system"
+        set(value) = prefs.edit().putString("dark_mode", value).apply()
+
+    var downloadUri: String
+        get() = prefs.getString("download_uri", "") ?: ""
+        set(value) = prefs.edit().putString("download_uri", value).apply()
 }
