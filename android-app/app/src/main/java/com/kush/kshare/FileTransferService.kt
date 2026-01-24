@@ -12,6 +12,7 @@ import android.os.Environment
 import android.os.IBinder
 import android.provider.OpenableColumns
 import androidx.core.content.IntentCompat
+import android.webkit.MimeTypeMap
 import androidx.core.app.NotificationCompat
 import androidx.core.content.FileProvider
 import com.kush.kshare.api.ApiClient
@@ -145,7 +146,18 @@ class FileTransferService : Service() {
             try {
                 var startTime = System.currentTimeMillis()
                 ApiClient.downloadFile(serverIp, serverPort, fileName, pairingCode) { encryptedStream, total ->
-                    val outputFile = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), fileName)
+                    val downloadsDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
+                    var outputFile = File(downloadsDir, fileName)
+                    var count = 1
+                    val nameWithoutExt = outputFile.nameWithoutExtension
+                    val ext = outputFile.extension
+                    
+                    while (outputFile.exists()) {
+                        val newName = if (ext.isNotEmpty()) "$nameWithoutExt ($count).$ext" else "$nameWithoutExt ($count)"
+                        outputFile = File(downloadsDir, newName)
+                        count++
+                    }
+
                     FileOutputStream(outputFile).use { output ->
                         ApiClient.decryptStream(encryptedStream, output, pairingCode) { downloaded ->
                             val currentTime = System.currentTimeMillis()
@@ -157,7 +169,7 @@ class FileTransferService : Service() {
                         }
                     }
                     MediaScannerConnection.scanFile(this@FileTransferService, arrayOf(outputFile.absolutePath), null, null)
-                    withContext(Dispatchers.Main) { showDownloadCompleteNotification(System.currentTimeMillis().toInt(), fileName, outputFile) }
+                    withContext(Dispatchers.Main) { showDownloadCompleteNotification(System.currentTimeMillis().toInt(), outputFile.name, outputFile) }
                 }
             } catch (e: Exception) {
                 withContext(Dispatchers.Main) { showCompletionNotification(System.currentTimeMillis().toInt(), "Download error: ${e.message}") }
@@ -237,7 +249,15 @@ class FileTransferService : Service() {
     private fun showDownloadCompleteNotification(id: Int, fileName: String, file: File) {
         val intent = Intent(Intent.ACTION_VIEW)
         val uri = FileProvider.getUriForFile(this, "$packageName.provider", file)
-        intent.setDataAndType(uri, contentResolver.getType(uri) ?: "*/*")
+        
+        val extension = MimeTypeMap.getFileExtensionFromUrl(Uri.fromFile(file).toString())
+        val mimeType = if (extension != null) {
+            MimeTypeMap.getSingleton().getMimeTypeFromExtension(extension.lowercase(Locale.getDefault()))
+        } else {
+            null
+        } ?: "*/*"
+        
+        intent.setDataAndType(uri, mimeType)
         intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
         val pendingIntent = PendingIntent.getActivity(this, 0, intent, PendingIntent.FLAG_IMMUTABLE)
         val notification = NotificationCompat.Builder(this, "transfer")
