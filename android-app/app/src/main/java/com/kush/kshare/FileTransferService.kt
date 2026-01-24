@@ -198,12 +198,18 @@ class FileTransferService : Service() {
     }
     
     private fun createNotification(text: String): Notification {
+        val intent = Intent(this, MainActivity::class.java).apply {
+            flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK
+        }
+        val pendingIntent = PendingIntent.getActivity(this, 0, intent, PendingIntent.FLAG_IMMUTABLE)
+
         return NotificationCompat.Builder(this, "transfer")
             .setContentTitle("K-Share")
             .setContentText(text)
             .setSmallIcon(R.drawable.ic_notification)
             .setOngoing(true)
             .setPriority(NotificationCompat.PRIORITY_LOW)
+            .setContentIntent(pendingIntent)
             .build()
     }
     
@@ -213,11 +219,17 @@ class FileTransferService : Service() {
     }
     
     private fun showCompletionNotification(id: Int, text: String) {
+        val intent = Intent(this, MainActivity::class.java).apply {
+            flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK
+        }
+        val pendingIntent = PendingIntent.getActivity(this, 0, intent, PendingIntent.FLAG_IMMUTABLE)
+
         val notification = NotificationCompat.Builder(this, "transfer")
             .setContentTitle("K-Share")
             .setContentText(text)
             .setSmallIcon(R.drawable.ic_notification)
             .setAutoCancel(true)
+            .setContentIntent(pendingIntent)
             .build()
         getSystemService(NotificationManager::class.java).notify(id, notification)
     }

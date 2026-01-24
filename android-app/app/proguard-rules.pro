@@ -19,3 +19,14 @@
 # If you keep the line number information, uncomment this to
 # hide the original source file name.
 #-renamesourcefileattribute SourceFile
+
+# Keep API data classes for Gson serialization
+-keep class com.kush.kshare.api.** { *; }
+# Keep the internal database implementation used by WorkManager
+-keep class androidx.work.impl.WorkDatabase_Impl { *; }
+
+# Gson Generics support (Critical for TypeToken)
+-keepattributes Signature
+-keepattributes *Annotation*
+-keep class com.google.gson.reflect.TypeToken { *; }
+-keep class * extends com.google.gson.reflect.TypeToken
