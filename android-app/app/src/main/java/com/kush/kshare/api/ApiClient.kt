@@ -95,6 +95,15 @@ object ApiClient {
         }
     }
 
+    /**
+     * Verifies an encrypted ping response contains "ok".
+     * Used by NetworkScanner for server discovery.
+     */
+    fun verifyPingResponse(encryptedBody: String, pairingCode: String): Boolean {
+        val decrypted = decryptData(encryptedBody, pairingCode) ?: return false
+        return String(decrypted).contains("ok")
+    }
+
     suspend fun decryptStream(input: InputStream, output: OutputStream, pairingCode: String, onProgress: (Long) -> Unit) {
         val key = getEncryptionKey(pairingCode)
         val nonce = ByteArray(12)
@@ -132,23 +141,6 @@ object ApiClient {
             onProgress(totalDecrypted)
             chunkIndex++
         }
-    }
-
-    fun fetchIpFromGist(gistUrl: String, jsonKey: String, onResult: (String?) -> Unit) {
-        if (gistUrl.isEmpty()) { onResult(null); return }
-        val request = Request.Builder().url("$gistUrl?t=${System.currentTimeMillis()}").build()
-        client.newCall(request).enqueue(object : Callback {
-            override fun onFailure(call: Call, e: java.io.IOException) { onResult(null) }
-            override fun onResponse(call: Call, response: Response) {
-                val body = response.body?.string()
-                if (response.isSuccessful && body != null) {
-                    try {
-                        val map = gson.fromJson<Map<String, String>>(body, object : TypeToken<Map<String, String>>() {}.type)
-                        onResult(map[jsonKey])
-                    } catch (e: Exception) { onResult(null) }
-                } else { onResult(null) }
-            }
-        })
     }
 
     suspend fun ping(serverIp: String, port: Int, pairingCode: String): Boolean {

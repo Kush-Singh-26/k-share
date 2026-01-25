@@ -14,7 +14,7 @@
 
 # Uncomment this to preserve the line number information for
 # debugging stack traces.
-#-keepattributes SourceFile,LineNumberTable
+-keepattributes SourceFile,LineNumberTable
 
 # If you keep the line number information, uncomment this to
 # hide the original source file name.
@@ -31,3 +31,12 @@
 -keep class com.google.gson.reflect.TypeToken { *; }
 -keep class * extends com.google.gson.reflect.TypeToken
 -keepattributes EnclosingMethod, InnerClasses
+
+# OkHttp Platform & Reflection
+-keep class okhttp3.** { *; }
+-keep interface okhttp3.** { *; }
+-dontwarn okhttp3.**
+
+# Kotlin Coroutines
+-keep class kotlinx.coroutines.** { *; }
+-dontwarn kotlinx.coroutines.**

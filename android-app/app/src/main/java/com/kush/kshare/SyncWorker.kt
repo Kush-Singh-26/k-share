@@ -3,22 +3,25 @@ package com.kush.kshare
 import android.content.Context
 import androidx.work.CoroutineWorker
 import androidx.work.WorkerParameters
-import com.kush.kshare.api.ApiClient
 
 class SyncWorker(context: Context, params: WorkerParameters) : CoroutineWorker(context, params) {
     override suspend fun doWork(): Result {
-        val prefs = applicationContext.getSharedPreferences("settings", Context.MODE_PRIVATE)
-        val gistUrl = prefs.getString("gist_url", "") ?: ""
-        val jsonKey = prefs.getString("gist_json_key", "ip") ?: "ip"
-
-        if (gistUrl.isEmpty()) return Result.success()
-
+        val settings = SettingsManager(applicationContext)
+        
+        // Check if we have a valid LAN
+        if (!NetworkScanner.hasValidLan(applicationContext)) {
+            return Result.success()
+        }
+        
+        val networkId = NetworkScanner.getNetworkId(applicationContext) ?: return Result.success()
+        val cachedIp = settings.getLastServerIp(networkId) ?: return Result.success()
+        val port = settings.serverPort.toIntOrNull() ?: 26260
+        
         return try {
-            // Just update the IP in shared preferences
-            ApiClient.fetchIpFromGist(gistUrl, jsonKey) { ip ->
-                if (ip != null) {
-                    prefs.edit().putString("server_ip", ip).apply()
-                }
+            // Quick ping to verify cached IP is still valid
+            val isOnline = NetworkScanner.quickPing(cachedIp, port, settings.pairingCode)
+            if (isOnline) {
+                settings.serverIp = cachedIp
             }
             Result.success()
         } catch (e: Exception) {

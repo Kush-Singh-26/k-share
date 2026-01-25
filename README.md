@@ -1,54 +1,113 @@
 # K-Share: Encrypted Local Media Sharing
 
-A high-performance, professional-grade alternative to cloud sharing. **K-Share** bridges the gap between your Android device and Windows PC with real-time synchronization, robust encryption, and a "set-and-forget" background architecture.
+A high-performance, professional-grade alternative to cloud sharing. K-Share bridges the gap between your Android device and Windows PC with real-time synchronization, robust encryption, and a "set-and-forget" background architecture.
 
 ---
 
-## 💎 Core Features
+## Core Features
 
-### ⚡ **Real-Time Clipboard**
+### Real-Time Clipboard
 * **Instant Sync:** Uses WebSockets to push text and links between devices in milliseconds.
 * **Rich Link Support:** URLs in the clipboard and history are automatically detected and clickable on both Android and the Web Dashboard.
 * **History:** Securely stores the last 20 snippets with selective deletion support.
 
-### 📂 **Seamless File & Folder Transfer**
+### Seamless File & Folder Transfer
 * **Folder Support:** Transfer entire directory structures. The PC server zips folders on-the-fly, and the Android app automatically decrypts and unzips them, preserving your nested file hierarchy.
 * **Recursive Uploads:** Pick an entire folder from your Android device to sync to your PC in one tap.
 * **No-Overwrite Protection:** Automatic versioning (e.g., `document (1).pdf`) ensures you never lose a file by mistake.
 * **Drag & Drop:** Drop files or entire folders directly into your browser to send them to your phone.
 * **Smart Previews:** High-performance thumbnail generation for images with dual-layer (Memory + Disk) caching on Android.
 
-### 🌓 **Modern UI/UX**
-* **Full Dark Mode:** Both the Android app and Web Dashboard support system-aware and manual dark mode toggles.
-* **Custom Storage:** Choose any location on your Android device (Internal storage, SD card, or specific subdirectories) as your persistent download folder.
-* **Optimized Layout:** Compact Android interface prioritizing shared space between your clipboard and file list.
-
-### 🔐 **Security-First Design**
+### Security-First Design
 * **AES-256-GCM:** All data (clipboard, file lists, and files) is wrapped in secured encryption.
 * **Zero-Knowledge:** Your "Pairing Code" never leaves your local network. It is hashed (SHA-256) locally to derive encryption keys.
 * **Smart Diagnostics:** Android app provides specific connection error messages (e.g., "Connection Refused", "Decryption Failed") for easy troubleshooting.
 * **Replay Protection:** Encrypted payloads include UTC timestamps to prevent intercepted message re-injection.
 
-### 🖱️ **Desktop Integration**
+### Desktop Integration
 * **System Tray:** Runs silently in the Windows tray. Right-click to open the dashboard or exit.
 * **Auto-Start:** Simply type `shell:startup` in the Run dialog (`Win+R`) and paste a shortcut to `k-share.exe` to have it start with Windows.
 * **Open on PC:** One-tap from the Android share menu to instantly launch a URL in your laptop's default browser.
 
 ---
 
-## 🛠️ Compilation Guide (Windows Server)
+## Smart Network Discovery
 
-You can compile the Go server into a single executable using one of two methods. These commands use optimization flags to produce the smallest possible binary.
+K-Share uses an intelligent, tiered TCP-based discovery system that automatically finds your server on the local network.
 
-### **Method 1: Console Mode (With Terminal)**
-Use this for initial setup or debugging. This version will keep a Command Prompt window open while running.
+### Discovery Journey: Why TCP?
+
+| Approach | Problem |
+|----------|---------|
+| **mDNS (Bonjour/Avahi)** | Blocked on most university/corporate WiFi networks due to multicast restrictions |
+| **GitHub Gist "Dead Drop"** | Requires internet access; fails on pure LAN/hotspot setups |
+| **UDP Broadcast** | Also blocked by enterprise routers; unreliable packet delivery |
+| **TCP Port Scanning** | Works everywhere - just standard HTTP requests that no network blocks |
+
+### Priority Zone Scanning
+
+The app scans in progressive zones, stopping immediately when the server is found:
+
+```mermaid
+flowchart TD
+    A[Find Server] --> B{Cached IP exists?}
+    B -->|Yes| C[Quick Ping cached IP]
+    C -->|Success| Z[Connected]
+    C -->|Fail| D[Zone 1: Own /24]
+    B -->|No| D
+    D -->|Found| Z
+    D -->|Not Found| E[Zone 2: ±2 blocks]
+    E -->|Found| Z
+    E -->|Not Found| F[Zone 3: ±10 blocks]
+    F -->|Found| Z
+    F -->|Not Found| G[Server not found]
+```
+
+| Zone | Range | IPs Scanned | Time |
+|------|-------|-------------|------|
+| Cached | Last known IP | 1 | <200ms |
+| Zone 1 | Own /24 block | ~254 | <1s |
+| Zone 2 | ±2 neighbor blocks | ~1,270 | ~2-3s |
+| Zone 3 | ±10 blocks (deep) | ~5,334 | ~8-10s |
+
+### Technical Implementation
+
+**Worker Pool Architecture:**
+- 60 concurrent coroutines with bounded Channel
+- 150ms TCP connect timeout per IP
+- **Shuffled Scanning:** IPs are shuffled before scanning to avoid triggering router flood protection or rate limiting often associated with sequential port scans.
+- Early termination: All workers stop when server found
+
+**Hotspot Mode Detection:**
+- Prioritizes AP/tethering interfaces over mobile data
+- Correctly detects `10.x.x.x` hotspot LAN even when phone shows `100.x.x.x` carrier IP
+
+**Context-Aware Caching:**
+- Stores last working IP per network subnet (e.g., `192.168.1` → `192.168.1.50`)
+- Auto-connects in <200ms on known networks
+
+### Manual IP Fallback
+
+If auto-discovery fails (very large enterprise networks), you can:
+1. Type the server IP directly in the input field
+2. Press **Enter** to verify
+3. On success, IP is cached for future auto-connect
+
+---
+
+## Compilation Guide (Windows Server)
+
+You can compile the Go server into a single executable using one of two methods.
+
+### Method 1: Console Mode (With Terminal)
+Use this for initial setup or debugging.
 ```bash
 cd windows-server
 go build -trimpath -ldflags="-s -w" -o k-share.exe
 ```
 
-### **Method 2: Background Mode (Hidden Window)**
-Use this for daily usage. The server will start silently, and you will only see the **K-Share icon** in your system tray.
+### Method 2: Background Mode (Hidden Window)
+Use this for daily usage. The server will start silently in the system tray.
 ```bash
 cd windows-server
 go build -trimpath -ldflags="-s -w -H windowsgui" -o k-share.exe
@@ -56,80 +115,48 @@ go build -trimpath -ldflags="-s -w -H windowsgui" -o k-share.exe
 
 ---
 
-## ⚙️ Configuration
+## Configuration
 
 The server is controlled by `config.json` in the `windows-server` directory. 
 
-> **Quick Start:** A template file `config.example.json` is provided. Rename it to `config.json` and fill in your details.
+> A template file `config.example.json` is provided. Rename it to `config.json` and fill in your details.
 
 | Field | Description |
 | :--- | :--- |
 | `port` | The local port to run on (default: `26260`). |
 | `pairing_code` | Your private password. Must match on both PC and Phone. |
-| `github_token` | GitHub PAT for Gist-based discovery. |
-| `gist_id` | The ID of your private secret Gist. |
-| `gist_filename` | The name of the file inside the Gist (e.g., `server.json`). |
 | `to_phone_dir` | Local folder for files being sent to the phone. |
 | `from_phone_dir` | Local folder for files uploaded from the phone. |
 
 ---
 
-## 🌍 Zero-Config Discovery (GitHub Gists)
-
-To avoid manually typing your laptop's IP address every time your router assigns a new one (DHCP), K-Share uses a "Dead Drop" discovery mechanism via GitHub Gists.
-
-### **🔄 How it Works**
-1. **Server-Side (Push):** Every 2 minutes, the Windows server checks its local IP. If it changes, it automatically performs an encrypted `PATCH` request to your private GitHub Gist with the new address.
-2. **Android-Side (Pull):** When you tap **Re-Discover** (or every 15 minutes via background WorkManager), the app fetches the Gist content and updates its internal connection settings.
-3. **Resilience:** The server includes **smart offline detection**, capable of identifying your local LAN IP even without an active internet connection, ensuring manual pairing always works.
-
-### **1. Setup a Gist**
-1. Go to [gist.github.com](https://gist.github.com).
-2. Create a **new Secret Gist**.
-3. Name the file `server.json`.
-4. Add this content: `{"ip": "0.0.0.0"}`
-5. Click **Create secret gist**.
-6. **Important URL:** Click the **"Raw"** button on your new Gist. Copy this URL but **remove the specific commit hash** (the part between your username and the filename) so it always points to the latest version.
-   * *Correct:* `https://gist.githubusercontent.com/username/gist_id/raw/server.json`
-   * *Incorrect:* `https://gist.githubusercontent.com/username/gist_id/raw/LONG_HASH/server.json`
-
-### **2. Configure Windows Server**
-Edit `config.json` in the `windows-server` folder:
-* `gist_id`: The ID from your Gist URL.
-* `github_token`: Create a [GitHub Classic Token](https://github.com/settings/tokens) with the `gist` scope.
-* `gist_filename`: Must match the filename you used (e.g., `ip.json`).
-
-### **3. Configure Android App**
-1. Tap **Config** in the app.
-2. **Gist Raw URL**: Paste the "cleaned" Raw URL from Step 1.
-3. **JSON Key**: Set to `ip`.
-4. Tap **Save Settings** and then **Re-Discover**.
-
-
-> [!NOTE]
-> **Why not Tailscale or mDNS?**
-> Traditional discovery methods like mDNS (multicast) and Tailscale were intentionally avoided to ensure maximum compatibility with restrictive environments, such as university or corporate WiFi networks. These networks frequently block peer-to-peer discovery protocols and proprietary tunneling. K-Share's Gist-based "Dead Drop" system and direct WebSocket connections provide a robust alternative that works over standard ports.
-
----
-
-## 📱 Android Setup
+## Android Setup
 
 1. Open the project in **Android Studio**.
 2. Perform a **Build > Clean Project** then **Build > Rebuild Project**.
 3. Install the APK on your device.
-4. In **Settings**, enter your **Pairing Code** and **Gist URL**.
-5. Enable **WiFi** to begin syncing.
+4. In **Settings**, enter your **Pairing Code** (must match your `config.json`).
+5. Tap the **Refresh** button to discover the server.
+
+### Settings
+
+| Setting | Purpose |
+|---------|---------|
+| Theme | System / Light / Dark mode |
+| Download Location | Choose where files are saved |
+| Pairing Code | Must match Windows server config |
+| Saved Networks | View/delete cached network → IP pairs |
 
 ---
 
-## 🛰️ Technical Stack
+## Technical Stack
 
-* **Backend:** Go (Gorilla WebSockets, Systray, Resize Library).
-* **Web:** Vanilla JavaScript, Web Crypto API (SubtleCrypto).
-* **Mobile:** Kotlin, Jetpack Compose, WorkManager, OkHttp, LruCache, DocumentFile (SAF).
-* **Discovery:** Automated discovery via GitHub Gists (fallback to manual IP).
+* **Backend:** Go (Gorilla WebSockets, Systray, Resize Library)
+* **Web:** Vanilla JavaScript, Web Crypto API (SubtleCrypto)
+* **Mobile:** Kotlin, Jetpack Compose, WorkManager, OkHttp, LruCache, DocumentFile (SAF)
+* **Discovery:** Priority Zone TCP Scanning with context-aware IP caching
 
 ---
 
-## 📄 License
-This project is private and intended for personal use. Maintain your `pairing_code` and `github_token` securely.
+## License
+This project is private and intended for personal use.

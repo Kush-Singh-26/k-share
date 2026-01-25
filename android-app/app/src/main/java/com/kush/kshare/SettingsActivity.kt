@@ -14,9 +14,12 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Delete
 import androidx.documentfile.provider.DocumentFile
 
 class SettingsActivity : ComponentActivity() {
@@ -51,9 +54,6 @@ class SettingsActivity : ComponentActivity() {
 
 @Composable
 fun SettingsScreen(settings: SettingsManager, onPickFolder: () -> Unit, onSave: () -> Unit) {
-    var gistUrl by remember { mutableStateOf(settings.gistUrl) }
-    var port by remember { mutableStateOf(settings.serverPort) }
-    var jsonKey by remember { mutableStateOf(settings.gistJsonKey) }
     var pairingCode by remember { mutableStateOf(settings.pairingCode) }
     var themeMode by remember { mutableStateOf(settings.darkMode) }
     
@@ -103,39 +103,48 @@ fun SettingsScreen(settings: SettingsManager, onPickFolder: () -> Unit, onSave: 
         }
         
         OutlinedTextField(
-            value = gistUrl,
-            onValueChange = { gistUrl = it },
-            label = { Text("Gist Raw URL") },
-            modifier = Modifier.fillMaxWidth()
-        )
-        
-        OutlinedTextField(
-            value = port,
-            onValueChange = { port = it },
-            label = { Text("Port (e.g. 26260)") },
-            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-            modifier = Modifier.fillMaxWidth()
-        )
-        
-        OutlinedTextField(
-            value = jsonKey,
-            onValueChange = { jsonKey = it },
-            label = { Text("JSON Key (e.g. ip)") },
-            modifier = Modifier.fillMaxWidth()
-        )
-        
-        OutlinedTextField(
             value = pairingCode,
             onValueChange = { pairingCode = it },
             label = { Text("Pairing Code") },
             modifier = Modifier.fillMaxWidth()
         )
         
+        // Saved Networks Section
+        var savedIps by remember { mutableStateOf(settings.getAllSavedIps()) }
+        
+        if (savedIps.isNotEmpty()) {
+            Text("Saved Networks", style = MaterialTheme.typography.labelLarge)
+            OutlinedCard(modifier = Modifier.fillMaxWidth()) {
+                Column(modifier = Modifier.padding(12.dp)) {
+                    savedIps.forEach { (networkId, ip) ->
+                        Row(
+                            modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text("$networkId.* → $ip", style = MaterialTheme.typography.bodyMedium)
+                            }
+                            IconButton(
+                                onClick = {
+                                    settings.removeServerIp(networkId)
+                                    savedIps = settings.getAllSavedIps()
+                                }
+                            ) {
+                                Icon(
+                                    Icons.Default.Delete,
+                                    contentDescription = "Delete",
+                                    tint = MaterialTheme.colorScheme.error
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
         Button(
             onClick = {
-                settings.gistUrl = gistUrl.trim()
-                settings.serverPort = port.trim()
-                settings.gistJsonKey = jsonKey.trim()
                 settings.pairingCode = pairingCode.trim()
                 settings.darkMode = themeMode
                 onSave()

@@ -30,13 +30,11 @@ import (
 	"github.com/getlantern/systray"
 	"github.com/gorilla/websocket"
 	"github.com/nfnt/resize"
+	"golang.org/x/sys/windows/registry"
 )
 
 type Config struct {
 	Port        string `json:"port"`
-	GHToken     string `json:"github_token"`
-	GistID      string `json:"gist_id"`
-	GistFile    string `json:"gist_filename"`
 	FromPhone   string `json:"from_phone_dir"`
 	ToPhone     string `json:"to_phone_dir"`
 	PairingCode string `json:"pairing_code"`
@@ -62,8 +60,8 @@ const (
 var (
 	appConfig      Config
 	clipboardMutex sync.Mutex
-	lastKnownIP    string
 	hub            *Hub
+	lastKnownIP    string
 )
 
 // --- 🔌 WEBSOCKET HUB ---
@@ -558,35 +556,14 @@ func getOutboundIP() net.IP {
 	return net.IPv4(127, 0, 0, 1)
 }
 
-func updateSecretGist(ip string) {
-	url := fmt.Sprintf("https://api.github.com/gists/%s", appConfig.GistID)
-	contentJSON := fmt.Sprintf(`{"ip": "%s"}`, ip)
-	payload := map[string]interface{}{"files": map[string]interface{}{appConfig.GistFile: map[string]string{"content": contentJSON}}}
-	jsonBytes, _ := json.Marshal(payload)
-	req, _ := http.NewRequest("PATCH", url, bytes.NewBuffer(jsonBytes))
-	req.Header.Set("Authorization", "token "+appConfig.GHToken)
-	req.Header.Set("Content-Type", "application/json")
-	client := &http.Client{Timeout: 10 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		fmt.Printf("⚠️  Gist Update Offline: %v\n", err)
-		return
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode == 200 {
-		lastKnownIP = ip
-		log.Println("✅ GitHub Gist Updated!")
-	}
-}
-
-func startDiscoveryMonitor() {
+func startIPMonitor() {
 	for {
-		localIP := getOutboundIP().String()
-		if localIP != lastKnownIP {
-			log.Printf("🔄 IP Change Detected: %s -> %s. Updating Gist...\n", lastKnownIP, localIP)
-			updateSecretGist(localIP)
+		time.Sleep(30 * time.Second)
+		currentIP := getOutboundIP().String()
+		if currentIP != lastKnownIP && currentIP != "127.0.0.1" {
+			log.Printf("🔄 IP Changed: %s → %s\n", lastKnownIP, currentIP)
+			lastKnownIP = currentIP
 		}
-		time.Sleep(2 * time.Minute)
 	}
 }
 
@@ -632,11 +609,16 @@ func onReady() {
 	systray.SetTooltip("K-Share: Encrypted Local Sharing")
 	iconBytes := generateIcon()
 	systray.SetIcon(iconBytes)
+
+	// Auto-install context menu (HKCU, no admin needed)
+	go installContextMenu()
+
 	mIP := systray.AddMenuItem("IP: "+getOutboundIP().String(), "")
 	mIP.Disable()
 	systray.AddSeparator()
 	mOpen := systray.AddMenuItem("Open Dashboard", "Open browser interface")
 	mExit := systray.AddMenuItem("Exit", "Quit K-Share")
+
 	go func() {
 		for {
 			select {
@@ -653,6 +635,23 @@ func onReady() {
 func onExit() {}
 
 func main() {
+	// 1. Handle Context Menu CLI Args
+	if len(os.Args) > 1 {
+		switch os.Args[1] {
+		case "-install":
+			installContextMenu()
+			os.Exit(0)
+		case "-uninstall":
+			uninstallContextMenu()
+			os.Exit(0)
+		case "-send":
+			if len(os.Args) > 2 {
+				sendToPhone(os.Args[2])
+			}
+			os.Exit(0)
+		}
+	}
+
 	setupLogging()
 	loadConfig()
 	hub = newHub()
@@ -660,8 +659,9 @@ func main() {
 	os.MkdirAll(appConfig.FromPhone, 0755)
 	os.MkdirAll(appConfig.ToPhone, 0755)
 	localIP := getOutboundIP()
+	lastKnownIP = localIP.String()
 	log.Printf("📡 Local IP: %s\n", localIP)
-	go startDiscoveryMonitor()
+	go startIPMonitor()
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/ws", handleWS)
@@ -753,4 +753,96 @@ func main() {
 	}()
 
 	systray.Run(onReady, onExit)
+}
+
+// --- 🔧 CONTEXT MENU HELPERS ---
+
+func installContextMenu() {
+	exe, err := os.Executable()
+	if err != nil {
+		log.Fatalf("❌ Failed to get executable path: %v", err)
+	}
+
+	// 1. Create main key in HKCU (Software\Classes)
+	k, _, err := registry.CreateKey(registry.CURRENT_USER, `Software\Classes\*\shell\KShareSend`, registry.ALL_ACCESS)
+	if err != nil {
+		log.Printf("❌ Failed to create registry key in HKCU: %v\n", err)
+		return
+	}
+	defer k.Close()
+
+	if err := k.SetStringValue("", "Send to Phone (K-Share)"); err != nil {
+		log.Fatal(err)
+	}
+	if err := k.SetStringValue("Icon", exe); err != nil {
+		log.Fatal(err)
+	}
+
+	// 2. Create command key
+	ck, _, err := registry.CreateKey(registry.CURRENT_USER, `Software\Classes\*\shell\KShareSend\command`, registry.ALL_ACCESS)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer ck.Close()
+
+	cmd := fmt.Sprintf(`"%s" -send "%%1"`, exe)
+	if err := ck.SetStringValue("", cmd); err != nil {
+		log.Fatal(err)
+	}
+
+	fmt.Println("✅ Context menu installed successfully!")
+	time.Sleep(2 * time.Second)
+}
+
+func uninstallContextMenu() {
+	err := registry.DeleteKey(registry.CURRENT_USER, `Software\Classes\*\shell\KShareSend\command`)
+	if err != nil {
+		log.Printf("⚠️ Failed to delete command key: %v", err)
+	}
+	err = registry.DeleteKey(registry.CURRENT_USER, `Software\Classes\*\shell\KShareSend`)
+	if err != nil {
+		log.Printf("❌ Failed to delete main key: %v", err)
+	} else {
+		fmt.Println("✅ Context menu removed successfully!")
+	}
+	time.Sleep(1 * time.Second)
+}
+
+func sendToPhone(filePath string) {
+	loadConfig()
+	info, err := os.Stat(filePath)
+	if err != nil {
+		log.Fatalf("❌ File not found: %s", filePath)
+	}
+
+	destName := filepath.Base(filePath)
+	destPath := filepath.Join(appConfig.ToPhone, destName)
+
+	// Ensure destination directory exists
+	os.MkdirAll(appConfig.ToPhone, 0755)
+
+	fmt.Printf("📂 Copying %s -> %s\n", filePath, destPath)
+
+	srcFile, err := os.Open(filePath)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer srcFile.Close()
+
+	dstFile, err := os.Create(destPath)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer dstFile.Close()
+
+	if info.IsDir() {
+		log.Println("⚠️ Context menu currently supports single files only. Please zip folders first.")
+	} else {
+		_, err = io.Copy(dstFile, srcFile)
+		if err != nil {
+			log.Fatal(err)
+		}
+		fmt.Println("✅ Sent to Phone Storage!")
+		time.Sleep(2 * time.Second)
+	}
 }
