@@ -830,13 +830,6 @@ func main() {
 		}
 	})
 	mux.HandleFunc("/clipboard", handleClipboard)
-	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/" {
-			http.NotFound(w, r)
-			return
-		}
-		http.ServeFile(w, r, filepath.Join(getAppDir(), "index.html"))
-	})
 
 	go func() {
 		server := &http.Server{Addr: ":" + appConfig.Port, Handler: mux}
