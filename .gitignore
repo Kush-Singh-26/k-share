@@ -24,6 +24,14 @@ windows-server/config.json
 windows-server/clipboard.txt
 windows-server/clipboard_history.json
 .env
+*.syso
+windows-server/.thumbnails/
+windows-server/from_phone/
+windows-server/to_phone/
+
+# Windows Client
+windows-client/*.exe
+windows-client/current_theme.txt
 
 # IDEs
 .idea/

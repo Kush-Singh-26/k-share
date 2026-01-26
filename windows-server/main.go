@@ -7,8 +7,10 @@ import (
 	"crypto/cipher"
 	"crypto/rand"
 	"crypto/sha256"
+	_ "embed" // Embed support
 	"encoding/base64"
 	"encoding/binary"
+	"encoding/hex" // Added for thumbnail cache hashing
 	"encoding/json"
 	"fmt"
 	"image"
@@ -62,7 +64,19 @@ var (
 	clipboardMutex sync.Mutex
 	hub            *Hub
 	lastKnownIP    string
+	cacheDir       string // Added for thumbnail caching
 )
+
+func init() {
+	// Setup cache directory
+	exe, err := os.Executable()
+	if err != nil {
+		cacheDir = "cache"
+	} else {
+		cacheDir = filepath.Join(filepath.Dir(exe), ".thumbnails")
+	}
+	os.MkdirAll(cacheDir, 0755)
+}
 
 // --- 🔌 WEBSOCKET HUB ---
 type Hub struct {
@@ -473,12 +487,36 @@ func handleThumbnail(w http.ResponseWriter, r *http.Request) {
 		dir = appConfig.FromPhone
 	}
 	filePath := filepath.Join(dir, name)
-	file, err := os.Open(filePath)
+
+	// 1. Check if source file exists
+	info, err := os.Stat(filePath)
 	if err != nil {
 		http.Error(w, "File not found", http.StatusNotFound)
 		return
 	}
+
+	// 2. Generate Cache Filename (Hash of full path + modtime)
+	h := sha256.New()
+	h.Write([]byte(filePath))
+	h.Write([]byte(info.ModTime().String()))
+	hash := hex.EncodeToString(h.Sum(nil))
+	cachePath := filepath.Join(cacheDir, hash+".jpg")
+
+	// 3. Serve from Cache if exists
+	if _, err := os.Stat(cachePath); err == nil {
+		w.Header().Set("Content-Type", "image/jpeg")
+		http.ServeFile(w, r, cachePath)
+		return
+	}
+
+	// 4. Generate Thumbnail
+	file, err := os.Open(filePath)
+	if err != nil {
+		http.Error(w, "Read error", http.StatusInternalServerError)
+		return
+	}
 	defer file.Close()
+
 	ext := strings.ToLower(filepath.Ext(name))
 	var img image.Image
 	if ext == ".jpg" || ext == ".jpeg" {
@@ -486,11 +524,23 @@ func handleThumbnail(w http.ResponseWriter, r *http.Request) {
 	} else if ext == ".png" {
 		img, _ = png.Decode(file)
 	}
+
 	if img == nil {
 		http.Error(w, "Unsupported format", http.StatusBadRequest)
 		return
 	}
+
+	// Resize
 	m := resize.Thumbnail(128, 128, img, resize.Lanczos3)
+
+	// 5. Save to Cache
+	outFile, err := os.Create(cachePath)
+	if err == nil {
+		jpeg.Encode(outFile, m, nil)
+		outFile.Close()
+	}
+
+	// 6. Serve Generated
 	w.Header().Set("Content-Type", "image/jpeg")
 	jpeg.Encode(w, m, nil)
 }
@@ -567,6 +617,51 @@ func startIPMonitor() {
 	}
 }
 
+//go:embed Icon.png
+var iconData []byte
+
+func loadIcon() []byte {
+	if len(iconData) == 0 {
+		return generateIcon()
+	}
+
+	// Windows systray requires ICO format. We need to wrap the PNG bytes in an ICO header.
+	// 1. Decode PNG to get dimensions
+	cfg, _, err := image.DecodeConfig(bytes.NewReader(iconData))
+	if err != nil {
+		return generateIcon()
+	}
+
+	// 2. Construct ICO Header
+	ico := new(bytes.Buffer)
+	binary.Write(ico, binary.LittleEndian, uint16(0)) // Reserved
+	binary.Write(ico, binary.LittleEndian, uint16(1)) // Type (1=ICO)
+	binary.Write(ico, binary.LittleEndian, uint16(1)) // Count (1 image)
+
+	// 3. Directory Entry
+	w := cfg.Width
+	h := cfg.Height
+	if w >= 256 {
+		w = 0
+	}
+	if h >= 256 {
+		h = 0
+	}
+	binary.Write(ico, binary.LittleEndian, uint8(w))
+	binary.Write(ico, binary.LittleEndian, uint8(h))
+	binary.Write(ico, binary.LittleEndian, uint8(0))              // Palette count
+	binary.Write(ico, binary.LittleEndian, uint8(0))              // Reserved
+	binary.Write(ico, binary.LittleEndian, uint16(1))             // Color planes
+	binary.Write(ico, binary.LittleEndian, uint16(32))            // Bits per pixel
+	binary.Write(ico, binary.LittleEndian, uint32(len(iconData))) // Size of image data
+	binary.Write(ico, binary.LittleEndian, uint32(22))            // Offset of image data (6+16=22)
+
+	// 4. Image Data
+	ico.Write(iconData)
+
+	return ico.Bytes()
+}
+
 func generateIcon() []byte {
 	img := image.NewRGBA(image.Rect(0, 0, 32, 32))
 	bgColor := color.RGBA{63, 81, 181, 255}
@@ -606,8 +701,8 @@ func generateIcon() []byte {
 
 func onReady() {
 	systray.SetTitle("K-Share")
-	systray.SetTooltip("K-Share: Encrypted Local Sharing")
-	iconBytes := generateIcon()
+	systray.SetTooltip("K-Share-Server: Encrypted Local Sharing")
+	iconBytes := loadIcon()
 	systray.SetIcon(iconBytes)
 
 	// Auto-install context menu (HKCU, no admin needed)
@@ -615,15 +710,11 @@ func onReady() {
 
 	mIP := systray.AddMenuItem("IP: "+getOutboundIP().String(), "")
 	mIP.Disable()
-	systray.AddSeparator()
-	mOpen := systray.AddMenuItem("Open Dashboard", "Open browser interface")
 	mExit := systray.AddMenuItem("Exit", "Quit K-Share")
 
 	go func() {
 		for {
 			select {
-			case <-mOpen.ClickedCh:
-				exec.Command("rundll32", "url.dll,FileProtocolHandler", fmt.Sprintf("http://localhost:%s", appConfig.Port)).Start()
 			case <-mExit.ClickedCh:
 				systray.Quit()
 				os.Exit(0)
@@ -801,48 +892,70 @@ func uninstallContextMenu() {
 	}
 	err = registry.DeleteKey(registry.CURRENT_USER, `Software\Classes\*\shell\KShareSend`)
 	if err != nil {
-		log.Printf("❌ Failed to delete main key: %v", err)
+		log.Printf("⚠️ Failed to delete main key: %v", err)
 	} else {
-		fmt.Println("✅ Context menu removed successfully!")
+		fmt.Println("✅ Context menu uninstalled successfully!")
 	}
-	time.Sleep(1 * time.Second)
+	time.Sleep(2 * time.Second)
 }
 
 func sendToPhone(filePath string) {
+	fmt.Printf("🚀 Sending to phone: %s\n", filePath)
+
+	// Load config to get port
 	loadConfig()
+
+	// Detect if it's a file or folder
 	info, err := os.Stat(filePath)
 	if err != nil {
-		log.Fatalf("❌ File not found: %s", filePath)
+		log.Fatalf("❌ File check failed: %v", err)
 	}
 
-	destName := filepath.Base(filePath)
-	destPath := filepath.Join(appConfig.ToPhone, destName)
-
-	// Ensure destination directory exists
-	os.MkdirAll(appConfig.ToPhone, 0755)
-
-	fmt.Printf("📂 Copying %s -> %s\n", filePath, destPath)
-
-	srcFile, err := os.Open(filePath)
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer srcFile.Close()
-
-	dstFile, err := os.Create(destPath)
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer dstFile.Close()
-
+	url := fmt.Sprintf("http://localhost:%s/upload?name=%s", appConfig.Port, filepath.Base(filePath))
 	if info.IsDir() {
-		log.Println("⚠️ Context menu currently supports single files only. Please zip folders first.")
-	} else {
-		_, err = io.Copy(dstFile, srcFile)
-		if err != nil {
-			log.Fatal(err)
-		}
-		fmt.Println("✅ Sent to Phone Storage!")
-		time.Sleep(2 * time.Second)
+		// Just trigger UI to show it's unsupported or handle folder upload if implemented via CLI?
+		// For now, let's just say we support file sending via this simple CLI trigger.
+		// To support folder, we'd need to zip it first or use the /upload endpoint recursively?
+		// Actually, the server /upload endpoint handles streams.
+		// Making a CLI uploader is complex.
+		// A simpler way: Just launch the GUI app if not running?
+		// Or send a signal to the running app?
 	}
+
+	// Real implementation:
+	// We should probably just trigger the upload to the LOCAL server directly via HTTP.
+
+	// Create pipe for streaming
+	pr, pw := io.Pipe()
+	go func() {
+		defer pw.Close()
+		file, err := os.Open(filePath)
+		if err != nil {
+			return
+		}
+		defer file.Close()
+		// Encrypt on the fly?
+		// Wait, the /upload endpoint implementation EXPECTS an encrypted stream from the client?
+		// Yes: handleUpload calls decryptStream(destFile, r.Body).
+		// So we must encrypt it before sending to localhost /upload.
+		encryptStream(pw, file)
+	}()
+
+	req, err := http.NewRequest("POST", url, pr)
+	if err != nil {
+		log.Fatalf("❌ Failed to create request: %v", err)
+	}
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		log.Fatalf("❌ Upload failed (is K-Share running?): %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == 200 {
+		fmt.Println("✅ Sent successfully!")
+	} else {
+		fmt.Printf("❌ Server returned: %s\n", resp.Status)
+	}
+	time.Sleep(2 * time.Second)
 }
