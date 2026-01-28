@@ -255,6 +255,21 @@ object ApiClient {
         } catch (e: Exception) { false }
     }
 
+    suspend fun deleteFile(serverIp: String, port: Int, fileName: String, pairingCode: String): Boolean {
+        val encodedName = java.net.URLEncoder.encode(fileName, "UTF-8")
+        val request = Request.Builder()
+            .url("https://$serverIp:$port/delete?name=$encodedName")
+            .header("Authorization", "Bearer $pairingCode")
+            .delete()
+            .build()
+
+        return try {
+            withContext(Dispatchers.IO) {
+                client.newCall(request).execute().use { it.isSuccessful }
+            }
+        } catch (e: Exception) { false }
+    }
+
     suspend fun downloadFile(
         serverIp: String,
         port: Int,

@@ -236,3 +236,24 @@ func (c *Client) DeleteHistoryItem(id string) error {
 
 	return nil
 }
+
+// DeleteFile moves a file to trash (admin only)
+func (c *Client) DeleteFile(filename string) error {
+	req, err := http.NewRequest("DELETE", c.BaseURL+"/delete?name="+url.QueryEscape(filename), nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+c.AuthCode)
+
+	resp, err := c.HTTPClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		return fmt.Errorf("delete failed: status %d", resp.StatusCode)
+	}
+
+	return nil
+}

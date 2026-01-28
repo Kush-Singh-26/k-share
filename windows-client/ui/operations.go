@@ -88,12 +88,18 @@ func (a *App) completeConnection(role string) {
 		fyne.Do(func() {
 			a.clipChannelSelect.Hide()
 			a.clipGuestLabel.Show()
+			if a.historyBtn != nil {
+				a.historyBtn.Hide()
+			}
 		})
 	} else {
 		a.isGuest = false
 		fyne.Do(func() {
 			a.clipChannelSelect.Show()
 			a.clipGuestLabel.Hide()
+			if a.historyBtn != nil {
+				a.historyBtn.Show()
+			}
 		})
 	}
 
@@ -241,10 +247,14 @@ func (a *App) loadFiles() {
 		a.statusText.Set("🔴 Load failed: " + err.Error())
 		return
 	}
-	a.files = files
-	if a.filesList != nil {
-		a.filesList.Refresh()
+	// Convert to []interface{} for UntypedList binding
+	data := make([]interface{}, len(files))
+	for i, f := range files {
+		data[i] = f
 	}
+
+	// Update binding (thread safe)
+	a.filesBinding.Set(data)
 }
 
 // getUniqueFilename returns a unique filename by adding numerical suffix if file exists
@@ -490,6 +500,9 @@ func (a *App) selectDownloadFolder() {
 
 // History operations
 func (a *App) loadHistory() {
+	if a.isGuest {
+		return
+	}
 	items, err := a.apiClient.GetHistory()
 	if err != nil {
 		log.Printf("Load history failed: %v", err)
@@ -505,4 +518,24 @@ func (a *App) deleteHistoryItem(id string) {
 		return
 	}
 	a.loadHistory()
+}
+
+func (a *App) deleteFile(filename string) {
+	if !dialog.Message("Delete %s?\nIt will be moved to the server's trash folder.", filepath.Base(filename)).
+		Title("Confirm Delete").
+		YesNo() {
+		return
+	}
+
+	a.statusText.Set("🗑️ Deleting...")
+	go func() {
+		err := a.apiClient.DeleteFile(filename)
+		if err != nil {
+			log.Printf("Delete failed: %v", err)
+			a.statusText.Set("🔴 Delete failed: " + err.Error())
+			return
+		}
+		a.statusText.Set("✅ Deleted: " + filename)
+		a.loadFiles()
+	}()
 }

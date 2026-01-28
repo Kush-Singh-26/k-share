@@ -34,9 +34,10 @@ type App struct {
 	filesList   *widget.List
 	historyList *widget.List
 	connectBtn  *widget.Button
+	historyBtn  *widget.Button
 
 	// Data
-	files        []api.FileInfo
+	filesBinding binding.UntypedList
 	historyItems []api.HistoryItem
 
 	// Theme tracking
@@ -66,7 +67,7 @@ func NewApp() *App {
 		downloadFolder: binding.NewString(),
 		statusText:     binding.NewString(),
 		clipboardText:  binding.NewString(),
-		files:          []api.FileInfo{},
+		filesBinding:   binding.NewUntypedList(),
 		historyItems:   []api.HistoryItem{},
 		currentTheme:   "light",
 	}
@@ -273,11 +274,11 @@ func (a *App) buildClipboardPanel() fyne.CanvasObject {
 		a.copyToSystemClipboard()
 	})
 
-	historyBtn := widget.NewButton("History", func() {
+	a.historyBtn = widget.NewButton("History", func() {
 		a.showHistoryPopup()
 	})
 
-	buttons := container.NewHBox(pushBtn, fetchBtn, copyBtn, historyBtn)
+	buttons := container.NewHBox(pushBtn, fetchBtn, copyBtn, a.historyBtn)
 
 	header := container.NewVBox(
 		container.NewBorder(nil, nil, titleLabel, container.NewStack(a.clipChannelSelect, a.clipGuestLabel)),
@@ -303,33 +304,68 @@ func (a *App) buildFilesPanel() fyne.CanvasObject {
 		a.uploadFolder()
 	})
 
-	uploadBtns := container.NewHBox(uploadFileBtn, uploadFolderBtn)
+	pasteBtn := widget.NewButton("📋 Paste & Send", func() {
+		a.pasteAndSend()
+	})
+	pasteBtn.Importance = widget.HighImportance
+
+	uploadBtns := container.NewHBox(uploadFileBtn, uploadFolderBtn, pasteBtn)
 
 	// Files list from server's from_phone folder
-	a.filesList = widget.NewList(
-		func() int {
-			return len(a.files)
-		},
+	a.filesList = widget.NewListWithData(
+		a.filesBinding,
 		func() fyne.CanvasObject {
 			thumb := canvas.NewImageFromImage(nil)
 			thumb.SetMinSize(fyne.NewSize(48, 48))
 			thumb.FillMode = canvas.ImageFillContain
-			return container.NewHBox(
+			return container.NewBorder(
+				nil, nil,
 				thumb,
+				widget.NewButton("🗑️", func() {}), // Delete button (Right)
 				container.NewVBox(
-					widget.NewLabel(""), // File name with icon
-					widget.NewLabel(""), // Size • Timestamp
+					widget.NewLabel(""), // File name
+					widget.NewLabel(""), // Info
 				),
 			)
 		},
-		func(id widget.ListItemID, obj fyne.CanvasObject) {
-			file := a.files[id]
-			box := obj.(*fyne.Container)
+		func(i binding.DataItem, obj fyne.CanvasObject) {
+			itemVal, _ := i.(binding.Untyped).Get()
+			file := itemVal.(api.FileInfo)
 
-			thumbImg := box.Objects[0].(*canvas.Image)
-			infoBox := box.Objects[1].(*fyne.Container)
+			box := obj.(*fyne.Container) // Border container
+
+			var thumbImg *canvas.Image
+			var delBtn *widget.Button
+			var infoBox *fyne.Container
+
+			// Robustly find objects by type (NewBorder order can vary)
+			for _, o := range box.Objects {
+				switch obj := o.(type) {
+				case *canvas.Image:
+					thumbImg = obj
+				case *widget.Button:
+					delBtn = obj
+				case *fyne.Container:
+					infoBox = obj
+				}
+			}
+
+			if thumbImg == nil || delBtn == nil || infoBox == nil {
+				return // Should not happen
+			}
+
 			nameLabel := infoBox.Objects[0].(*widget.Label)
 			infoLabel := infoBox.Objects[1].(*widget.Label)
+
+			// Configure delete button
+			delBtn.OnTapped = func() {
+				a.deleteFile(file.Name)
+			}
+			if a.isGuest {
+				delBtn.Hide()
+			} else {
+				delBtn.Show()
+			}
 
 			// Handle "Guest" prefix
 			displayName := file.Name
@@ -375,7 +411,11 @@ func (a *App) buildFilesPanel() fyne.CanvasObject {
 	)
 
 	a.filesList.OnSelected = func(id widget.ListItemID) {
-		a.downloadFile(a.files[id])
+		itemVal, err := a.filesBinding.GetValue(id)
+		if err == nil {
+			file := itemVal.(api.FileInfo)
+			a.downloadFile(file)
+		}
 		a.filesList.UnselectAll()
 	}
 

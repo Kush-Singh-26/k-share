@@ -137,6 +137,12 @@ var upgrader = websocket.Upgrader{
 }
 
 func handleWS(w http.ResponseWriter, r *http.Request) {
+	// Security: Require authentication before WebSocket upgrade
+	if getRole(r) == "none" {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		log.Println("Upgrade error:", err)
@@ -172,6 +178,20 @@ func setupLogging() {
 func loadConfig() {
 	file, err := os.Open(filepath.Join(getAppDir(), "config.json"))
 	if err != nil {
+		if os.IsNotExist(err) {
+			// Generate default config
+			log.Println("⚠️ config.json not found. Generating default...")
+			appConfig = Config{
+				Port:      "26260",
+				AdminCode: generateRandomCode(6),
+				GuestCode: "guest",
+				SharedDir: "k-share-files",
+			}
+			data, _ := json.MarshalIndent(appConfig, "", "  ")
+			os.WriteFile(filepath.Join(getAppDir(), "config.json"), data, 0644)
+			log.Printf("✨ Generated config.json with Admin Code: %s", appConfig.AdminCode)
+			return
+		}
 		log.Fatal("❌ Could not load config.json: ", err)
 	}
 	defer file.Close()
@@ -180,6 +200,18 @@ func loadConfig() {
 	if err != nil {
 		log.Fatal("❌ Invalid config.json format: ", err)
 	}
+}
+
+func generateRandomCode(length int) string {
+	const charset = "0123456789"
+	b := make([]byte, length)
+	if _, err := rand.Read(b); err != nil {
+		return "123456" // Fallback
+	}
+	for i := range b {
+		b[i] = charset[int(b[i])%len(charset)]
+	}
+	return string(b)
 }
 
 // Auth & Role-based access control
@@ -304,11 +336,14 @@ func handleListFiles(w http.ResponseWriter, r *http.Request) {
 			if err != nil {
 				continue
 			}
-			// Skip valid items
+			// Skip hidden system items
 			name := info.Name()
 			if name == "Public" && prefix == "" {
 				continue
 			} // Skip Public folder itself in root listing
+			if name == ".trash" {
+				continue
+			} // Skip trash folder from listings
 
 			files = append(files, FileInfo{
 				Name:        prefix + name,
@@ -331,6 +366,68 @@ func handleListFiles(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(files)
+}
+
+// handleDelete moves files to .trash folder (admin only)
+func handleDelete(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodDelete && r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Admin only
+	if getRole(r) != "admin" {
+		http.Error(w, "Forbidden", http.StatusForbidden)
+		return
+	}
+
+	filename := r.URL.Query().Get("name")
+	if filename == "" {
+		http.Error(w, "Missing filename", http.StatusBadRequest)
+		return
+	}
+
+	// Validate path
+	fullPath := filepath.Join(appConfig.SharedDir, filepath.Clean(filename))
+
+	// Debug logging
+	log.Printf("🗑️ Delete request: name='%s', fullPath='%s'", filename, fullPath)
+
+	absPath, err := filepath.Abs(fullPath)
+	if err != nil {
+		http.Error(w, "Invalid path", http.StatusBadRequest)
+		return
+	}
+	absRoot, _ := filepath.Abs(appConfig.SharedDir)
+	if !strings.HasPrefix(absPath, absRoot+string(filepath.Separator)) && absPath != absRoot {
+		http.Error(w, "Access denied", http.StatusForbidden)
+		return
+	}
+
+	// Check file exists
+	if _, err := os.Stat(fullPath); os.IsNotExist(err) {
+		http.Error(w, "File not found", http.StatusNotFound)
+		return
+	}
+
+	// Create .trash folder if needed
+	trashDir := filepath.Join(appConfig.SharedDir, ".trash")
+	os.MkdirAll(trashDir, 0755)
+
+	// Move to trash with unique name
+	baseName := filepath.Base(filename)
+	trashPath := filepath.Join(trashDir, baseName)
+	trashPath = getUniqueFilenameServer(trashPath)
+
+	if err := os.Rename(fullPath, trashPath); err != nil {
+		log.Printf("❌ Failed to move to trash: %v", err)
+		http.Error(w, "Delete failed", http.StatusInternalServerError)
+		return
+	}
+
+	log.Printf("🗑️ Moved to trash: %s", filename)
+	w.WriteHeader(http.StatusOK)
+	notifyChange("files")
 }
 
 func handleClipboard(w http.ResponseWriter, r *http.Request) {
@@ -525,7 +622,15 @@ func handleOpen(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	body, _ := io.ReadAll(r.Body)
-	url := string(body)
+	url := strings.TrimSpace(string(body))
+
+	// Security: Only allow HTTPS URLs to prevent arbitrary code execution
+	if !strings.HasPrefix(url, "https://") {
+		log.Printf("⚠️ Blocked unsafe URL: %s\n", url)
+		http.Error(w, "Only HTTPS URLs are allowed", http.StatusBadRequest)
+		return
+	}
+
 	log.Printf("🌐 Opening URL on PC: %s\n", url)
 	exec.Command("rundll32", "url.dll,FileProtocolHandler", url).Start()
 	w.WriteHeader(http.StatusOK)
@@ -829,6 +934,7 @@ func main() {
 	mux.HandleFunc("/clipboard", requireAuth(handleClipboard))
 	mux.HandleFunc("/clipboard/history", requireAuth(handleHistory))
 	mux.HandleFunc("/files", requireAuth(handleListFiles))
+	mux.HandleFunc("/delete", requireAuth(handleDelete))
 
 	mux.HandleFunc("/download/", requireAuth(func(w http.ResponseWriter, r *http.Request) {
 		path := r.URL.Path

@@ -245,5 +245,39 @@ The server is controlled by `config.json` in the `windows-server` directory.
 
 ---
 
+---
+
+## 📦 Installation & Release Guide
+
+This guide explains how to set up K-Share using the distributed executable files (`k-share-server.exe` and `k-share-client.exe`).
+
+### 🖥️ Server Setup (Windows)
+
+1. **Download**: Place `k-share-server.exe` in a dedicated folder (e.g., `C:\K-Share`).
+2. **Run**: Double-click `k-share-server.exe` to start the server.
+3. **First Run Initialization**:
+   The server will automatically generate the basic files in the same folder:
+   - `config.json`: Contains your **Admin Code** and settings.
+   - `cert.pem` and `key.pem`: Security certificates for encrypted connection.
+   - `k-share-files`: This is your shared storage folder.
+4. **Firewall**: If Windows Firewall prompts you, click **Allow access** (Private Networks).
+5. **Get the Admin Code**:
+   - Open `config.json` with Notepad.
+   - Verify the `"admin_code"` value. You will need this to connect your devices.
+
+### 💻 Client Setup (Windows PC)
+
+1. **Download**: Place `k-share-client.exe` anywhere on your PC.
+2. **Run**: Launch the application.
+3. **Connect**:
+   - **Server IP**: Enter the IP address of the PC running the server.
+   - **Port**: Default is `26260`.
+   - **Pairing Code**: Enter the **Admin Code** from the server's `config.json`.
+4. **Trust Certificate**:
+   - On first connection, you will see a "Trust This Server?" dialog.
+   - Click **Trust** to proceed.
+
+---
+
 ## License
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.

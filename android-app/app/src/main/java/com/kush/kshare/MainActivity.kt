@@ -205,6 +205,9 @@ class MainActivity : ComponentActivity() {
         stopPolling()
     }
 
+    // Discovery status text
+    private var fileToDeleteState = mutableStateOf<RemoteFile?>(null)
+
     @Composable
     fun MainScreen() {
         val isDark = when (themeModeState.value) {
@@ -212,6 +215,39 @@ class MainActivity : ComponentActivity() {
             "dark" -> true
             else -> isSystemInDarkTheme()
         }
+        
+        if (fileToDeleteState.value != null) {
+             AlertDialog(
+                 onDismissRequest = { fileToDeleteState.value = null },
+                 title = { Text("Delete File?") },
+                 text = { Text("Are you sure you want to delete '${fileToDeleteState.value?.name}'?\nIt will be moved to the trash folder.") },
+                 confirmButton = {
+                     Button(
+                         onClick = {
+                             val file = fileToDeleteState.value
+                             if (file != null) {
+                                 lifecycleScope.launch {
+                                     val ip = serverIpState.value
+                                     val port = serverPortState.value.toIntOrNull() ?: 26260
+                                     if (ApiClient.deleteFile(ip, port, file.name, settings.pairingCode)) {
+                                         Toast.makeText(this@MainActivity, "Deleted", Toast.LENGTH_SHORT).show()
+                                         refreshFileList()
+                                     } else {
+                                         Toast.makeText(this@MainActivity, "Delete failed", Toast.LENGTH_SHORT).show()
+                                     }
+                                 }
+                             }
+                             fileToDeleteState.value = null
+                         },
+                         colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error)
+                     ) { Text("Delete") }
+                 },
+                 dismissButton = {
+                     TextButton(onClick = { fileToDeleteState.value = null }) { Text("Cancel") }
+                 }
+             )
+        }
+
         Column(modifier = Modifier.padding(16.dp)) {
             // Settings Card
             Card(
@@ -491,6 +527,13 @@ class MainActivity : ComponentActivity() {
                     }
                 }
                 Text(if (file.isDir) "Folder • ${file.modTime}" else "${file.size / 1024} KB • ${file.modTime}", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+            
+            // Delete Button (if not guest)
+            if (!isGuestModeState.value) {
+                IconButton(onClick = { fileToDeleteState.value = file }) {
+                    Icon(Icons.Default.Delete, "Delete", tint = MaterialTheme.colorScheme.error)
+                }
             }
         }
     }
