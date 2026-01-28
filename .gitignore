@@ -10,9 +10,9 @@ captures/
 .externalNativeBuild/
 .cxx/
 android-app/app/google-services.json
+android-app/app/release/
 
-# Go
-windows-server/k-share.exe
+# Go Server
 windows-server/*.exe
 windows-server/*.exe~
 windows-server/*.dll
@@ -22,12 +22,16 @@ windows-server/*.test
 windows-server/*.out
 windows-server/config.json
 windows-server/clipboard.txt
+windows-server/guest_clipboard.txt
 windows-server/clipboard_history.json
-.env
-*.syso
+windows-server/server_log.txt
+windows-server/cert.pem
+windows-server/key.pem
 windows-server/.thumbnails/
 windows-server/from_phone/
 windows-server/to_phone/
+*.syso
+.env
 
 # Windows Client
 windows-client/*.exe
@@ -44,4 +48,3 @@ windows-client/current_theme.txt
 # Misc
 *.log
 tmp/
-server_log.txt
