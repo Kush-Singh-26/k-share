@@ -1,13 +1,15 @@
 package ui
 
 import (
+	"container/list"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
 	"image"
 	_ "image/jpeg"
-	"image/png" // Explicit import for png.Encode
+	"image/png"
 	"k-share-client/config"
+	"k-share-client/crypto"
 	"net/http"
 	"net/url"
 	"os"
@@ -19,25 +21,121 @@ import (
 	"fyne.io/fyne/v2/canvas"
 )
 
-// Thumbnail cache
-var thumbnailCache = make(map[string]image.Image)
-var cacheMutex sync.RWMutex
+const (
+	maxCacheSize   = 100 // Maximum thumbnails in memory
+	workerPoolSize = 4   // Concurrent thumbnail downloads
+)
 
-// Widget target map to safely handle list recycling
-// Maps pointer of Image widget -> Filename it SHOULD display
-var widgetTargets = make(map[*canvas.Image]string)
-var targetMutex sync.Mutex
+// LRU Cache for thumbnails
+type lruCache struct {
+	capacity int
+	cache    map[string]*list.Element
+	order    *list.List
+	mu       sync.Mutex
+}
 
-var cacheDir string
+type cacheEntry struct {
+	key   string
+	image image.Image
+}
+
+func newLRUCache(capacity int) *lruCache {
+	return &lruCache{
+		capacity: capacity,
+		cache:    make(map[string]*list.Element),
+		order:    list.New(),
+	}
+}
+
+func (c *lruCache) Get(key string) (image.Image, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if elem, ok := c.cache[key]; ok {
+		c.order.MoveToFront(elem)
+		return elem.Value.(*cacheEntry).image, true
+	}
+	return nil, false
+}
+
+func (c *lruCache) Put(key string, img image.Image) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if elem, ok := c.cache[key]; ok {
+		c.order.MoveToFront(elem)
+		elem.Value.(*cacheEntry).image = img
+		return
+	}
+
+	// Evict oldest if at capacity
+	if c.order.Len() >= c.capacity {
+		oldest := c.order.Back()
+		if oldest != nil {
+			c.order.Remove(oldest)
+			delete(c.cache, oldest.Value.(*cacheEntry).key)
+		}
+	}
+
+	elem := c.order.PushFront(&cacheEntry{key: key, image: img})
+	c.cache[key] = elem
+}
+
+// Thumbnail worker pool
+type thumbnailJob struct {
+	filename  string
+	imgWidget *canvas.Image
+	app       *App
+}
+
+var (
+	thumbnailCache = newLRUCache(maxCacheSize)
+	jobQueue       = make(chan thumbnailJob, 50)
+	workersStarted = false
+	workerMu       sync.Mutex
+
+	// Widget target map to handle list recycling
+	widgetTargets = make(map[*canvas.Image]string)
+	targetMutex   sync.Mutex
+
+	cacheDir   string
+	httpClient *http.Client
+)
 
 func init() {
-	// Setup cache directory
 	appData := os.Getenv("APPDATA")
 	if appData == "" {
 		appData = "."
 	}
 	cacheDir = filepath.Join(appData, "k-share-client", "cache")
 	os.MkdirAll(cacheDir, 0755)
+
+	// Shared HTTP client with TOFU TLS
+	httpClient = &http.Client{
+		Transport: &http.Transport{
+			TLSClientConfig: crypto.CreateTLSConfig(nil),
+		},
+	}
+}
+
+func startWorkers() {
+	workerMu.Lock()
+	defer workerMu.Unlock()
+
+	if workersStarted {
+		return
+	}
+	workersStarted = true
+
+	for i := 0; i < workerPoolSize; i++ {
+		go thumbnailWorker()
+	}
+}
+
+func thumbnailWorker() {
+	for job := range jobQueue {
+		loadThumbnailSync(job.app, job.filename, job.imgWidget)
+	}
 }
 
 func isImageFile(filename string) bool {
@@ -50,7 +148,6 @@ func isImageFile(filename string) bool {
 		strings.HasSuffix(lower, ".bmp")
 }
 
-// getFileIcon returns an emoji icon based on file type
 func getFileIcon(filename string, isDirectory bool) string {
 	if isDirectory {
 		return "📁"
@@ -58,7 +155,6 @@ func getFileIcon(filename string, isDirectory bool) string {
 
 	lower := strings.ToLower(filename)
 
-	// Documents
 	if strings.HasSuffix(lower, ".pdf") {
 		return "📕"
 	}
@@ -74,26 +170,18 @@ func getFileIcon(filename string, isDirectory bool) string {
 	if strings.HasSuffix(lower, ".txt") || strings.HasSuffix(lower, ".md") {
 		return "📝"
 	}
-
-	// Media
 	if strings.HasSuffix(lower, ".mp3") || strings.HasSuffix(lower, ".wav") || strings.HasSuffix(lower, ".flac") {
 		return "🎵"
 	}
 	if strings.HasSuffix(lower, ".mp4") || strings.HasSuffix(lower, ".avi") || strings.HasSuffix(lower, ".mkv") || strings.HasSuffix(lower, ".mov") {
 		return "🎬"
 	}
-
-	// Archives
 	if strings.HasSuffix(lower, ".zip") || strings.HasSuffix(lower, ".rar") || strings.HasSuffix(lower, ".7z") || strings.HasSuffix(lower, ".tar") {
 		return "📦"
 	}
-
-	// Code
 	if strings.HasSuffix(lower, ".go") || strings.HasSuffix(lower, ".py") || strings.HasSuffix(lower, ".js") || strings.HasSuffix(lower, ".java") || strings.HasSuffix(lower, ".cpp") {
 		return "💻"
 	}
-
-	// Images (will show thumbnail)
 	if isImageFile(filename) {
 		return "🖼️"
 	}
@@ -101,52 +189,64 @@ func getFileIcon(filename string, isDirectory bool) string {
 	return "📄"
 }
 
-// setThumbnailTarget registers which file this widget is supposed to show
 func (a *App) setThumbnailTarget(imgWidget *canvas.Image, filename string) {
 	targetMutex.Lock()
 	defer targetMutex.Unlock()
 	widgetTargets[imgWidget] = filename
 }
 
+// loadThumbnail queues a thumbnail load job (non-blocking)
 func (a *App) loadThumbnail(filename string, imgWidget *canvas.Image) {
-	// 1. Check Memory Cache
-	cacheMutex.RLock()
-	cached, ok := thumbnailCache[filename]
-	cacheMutex.RUnlock()
+	startWorkers()
 
-	if ok {
-		applyImage(a, imgWidget, filename, cached)
+	// Check memory cache first (fast path)
+	if img, ok := thumbnailCache.Get(filename); ok {
+		applyImage(a, imgWidget, filename, img)
 		return
 	}
 
-	// 2. Check Disk Cache
+	// Queue for async loading
+	select {
+	case jobQueue <- thumbnailJob{filename: filename, imgWidget: imgWidget, app: a}:
+	default:
+		// Queue full, skip this thumbnail
+	}
+}
+
+// loadThumbnailSync performs the actual thumbnail loading (called by workers)
+func loadThumbnailSync(a *App, filename string, imgWidget *canvas.Image) {
+	// Double-check memory cache
+	if img, ok := thumbnailCache.Get(filename); ok {
+		applyImage(a, imgWidget, filename, img)
+		return
+	}
+
+	// Check disk cache
 	hashedName := hashFilename(filename)
 	cachePath := filepath.Join(cacheDir, hashedName+".png")
 
 	if _, err := os.Stat(cachePath); err == nil {
-		// Found on disk
 		file, err := os.Open(cachePath)
 		if err == nil {
 			img, _, err := image.Decode(file)
 			file.Close()
 			if err == nil {
-				// Update memory cache
-				cacheMutex.Lock()
-				thumbnailCache[filename] = img
-				cacheMutex.Unlock()
-
+				thumbnailCache.Put(filename, img)
 				applyImage(a, imgWidget, filename, img)
 				return
 			}
 		}
 	}
 
-	// 3. Download
-	thumbURL := fmt.Sprintf("%s/thumbnail?folder=fromphone&name=%s",
-		"http://"+config.Current.ServerIP,
+	// Download from server
+	thumbURL := fmt.Sprintf("%s/thumbnail?name=%s",
+		"https://"+config.Current.ServerIP,
 		url.QueryEscape(filename))
 
-	resp, err := http.Get(thumbURL)
+	req, _ := http.NewRequest("GET", thumbURL, nil)
+	req.Header.Set("Authorization", "Bearer "+config.Current.PairingCode)
+
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return
 	}
@@ -156,13 +256,12 @@ func (a *App) loadThumbnail(filename string, imgWidget *canvas.Image) {
 		return
 	}
 
-	// Decode
 	img, _, err := image.Decode(resp.Body)
 	if err != nil {
 		return
 	}
 
-	// 4. Save to Disk (Async)
+	// Save to disk cache (async)
 	go func(img image.Image, path string) {
 		out, err := os.Create(path)
 		if err != nil {
@@ -172,11 +271,7 @@ func (a *App) loadThumbnail(filename string, imgWidget *canvas.Image) {
 		png.Encode(out, img)
 	}(img, cachePath)
 
-	// Update memory cache
-	cacheMutex.Lock()
-	thumbnailCache[filename] = img
-	cacheMutex.Unlock()
-
+	thumbnailCache.Put(filename, img)
 	applyImage(a, imgWidget, filename, img)
 }
 
@@ -187,6 +282,7 @@ func applyImage(a *App, imgWidget *canvas.Image, filename string, img image.Imag
 		targetMutex.Unlock()
 
 		if target == filename {
+			imgWidget.Resource = nil
 			imgWidget.Image = img
 			imgWidget.Refresh()
 		}

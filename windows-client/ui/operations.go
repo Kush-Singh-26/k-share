@@ -1,17 +1,23 @@
 package ui
 
 import (
-	"bytes"
+	"archive/zip"
 	"fmt"
 	"io"
 	"k-share-client/api"
 	"k-share-client/config"
 	"k-share-client/crypto"
 	"k-share-client/discovery"
+	"net"
+	"strings"
+
 	"log"
 	"os"
 	"path/filepath"
 
+	"fyne.io/fyne/v2"
+	"fyne.io/fyne/v2/container"
+	"fyne.io/fyne/v2/widget"
 	"github.com/atotto/clipboard"
 	"github.com/sqweek/dialog"
 )
@@ -23,10 +29,30 @@ func (a *App) connect() {
 		return
 	}
 
+	// Debounce: prevent multiple connection attempts
+	if a.isConnecting {
+		return
+	}
+	a.isConnecting = true
+	fyne.Do(func() {
+		if a.connectBtn != nil {
+			a.connectBtn.Disable()
+		}
+	})
+
 	a.statusText.Set("🟡 Connecting...")
 
 	go func() {
-		err := a.apiClient.Ping()
+		defer func() {
+			a.isConnecting = false
+			fyne.Do(func() {
+				if a.connectBtn != nil {
+					a.connectBtn.Enable()
+				}
+			})
+		}()
+
+		role, err := a.apiClient.Ping()
 
 		if err != nil {
 			log.Printf("Connection failed: %v", err)
@@ -34,16 +60,104 @@ func (a *App) connect() {
 			return
 		}
 
-		a.statusText.Set("🟢 Connected")
+		// TOFU Certificate Verification
+		certInfo := crypto.Manager.GetLastSeenCert()
+		if certInfo != nil && !crypto.Manager.IsTrusted(certInfo.Hash) {
+			serverIP, _ := a.serverIP.Get()
+			crypto.Manager.SetPendingCert(certInfo, serverIP)
 
-		// Connect WebSocket
-		a.wsClient.Connect()
+			// Show trust dialog on main thread
+			fyne.Do(func() {
+				a.showTrustDialog(certInfo, serverIP, role)
+			})
+			return // Wait for user decision
+		}
 
-		// Initial data fetch
-		a.fetchClipboard()
-		a.loadFiles()
-		a.loadHistory()
+		a.completeConnection(role)
 	}()
+}
+
+// completeConnection finishes the connection after trust is established
+func (a *App) completeConnection(role string) {
+	a.statusText.Set("🟢 Connected")
+
+	// Handle Role
+	if role == "guest" {
+		a.isGuest = true
+		a.clipboardChannel = "guest"
+		fyne.Do(func() {
+			a.clipChannelSelect.Hide()
+			a.clipGuestLabel.Show()
+		})
+	} else {
+		a.isGuest = false
+		fyne.Do(func() {
+			a.clipChannelSelect.Show()
+			a.clipGuestLabel.Hide()
+		})
+	}
+
+	// Connect WebSocket
+	a.wsClient.Connect()
+
+	// Initial data fetch
+	a.fetchClipboard()
+	a.loadFiles()
+	a.loadHistory()
+
+	// Save to SavedNetworks if it's a valid LAN IP
+	fullAddr, _ := a.serverIP.Get()
+	host, _, err := net.SplitHostPort(fullAddr)
+	if err == nil && host != "localhost" && host != "127.0.0.1" {
+		parts := strings.Split(host, ".")
+		if len(parts) == 4 {
+			subnet := fmt.Sprintf("%s.%s.%s", parts[0], parts[1], parts[2])
+			config.Current.SavedNetworks[subnet] = host
+			config.Save()
+		}
+	}
+}
+
+// showTrustDialog displays a dialog for TOFU certificate verification
+func (a *App) showTrustDialog(certInfo *crypto.CertInfo, serverIP string, role string) {
+	trustWindow := a.fyneApp.NewWindow("Trust This Server?")
+	trustWindow.Resize(fyne.NewSize(450, 300))
+
+	// Build certificate info display
+	infoText := fmt.Sprintf(
+		"A new server certificate was detected.\n\n"+
+			"Server: %s\n"+
+			"Fingerprint:\n%s\n\n"+
+			"Valid: %s to %s\n\n"+
+			"Do you want to trust this server?",
+		serverIP,
+		certInfo.Fingerprint,
+		certInfo.NotBefore,
+		certInfo.NotAfter,
+	)
+
+	infoLabel := widget.NewLabel(infoText)
+	infoLabel.Wrapping = fyne.TextWrapWord
+
+	trustBtn := widget.NewButton("✅ Trust", func() {
+		code, _ := a.pairingCode.Get()
+		crypto.Manager.TrustCertificate(certInfo.Hash, serverIP, "K-Share Server", code)
+		trustWindow.Close()
+		go a.completeConnection(role)
+	})
+	trustBtn.Importance = widget.HighImportance
+
+	cancelBtn := widget.NewButton("❌ Cancel", func() {
+		crypto.Manager.ClearPending()
+		a.statusText.Set("🔴 Connection cancelled")
+		trustWindow.Close()
+	})
+
+	buttons := container.NewHBox(cancelBtn, trustBtn)
+	content := container.NewBorder(nil, buttons, nil, nil, container.NewVScroll(infoLabel))
+
+	trustWindow.SetContent(content)
+	trustWindow.Show()
 }
 
 func (a *App) autoDiscover() {
@@ -93,7 +207,7 @@ func (a *App) autoDiscover() {
 
 // Clipboard operations
 func (a *App) fetchClipboard() {
-	text, err := a.apiClient.GetClipboard()
+	text, err := a.apiClient.GetClipboard(a.clipboardChannel)
 	if err != nil {
 		log.Printf("Fetch clipboard failed: %v", err)
 		return
@@ -103,7 +217,7 @@ func (a *App) fetchClipboard() {
 
 func (a *App) pushClipboard() {
 	text, _ := a.clipboardText.Get()
-	err := a.apiClient.PushClipboard(text)
+	err := a.apiClient.PushClipboard(text, a.clipboardChannel)
 	if err != nil {
 		log.Printf("Push clipboard failed: %v", err)
 		return
@@ -121,12 +235,16 @@ func (a *App) copyToSystemClipboard() {
 
 // File operations
 func (a *App) loadFiles() {
-	files, err := a.apiClient.ListFromPhoneFiles()
+	files, err := a.apiClient.ListFiles()
 	if err != nil {
 		log.Printf("Load files failed: %v", err)
+		a.statusText.Set("🔴 Load failed: " + err.Error())
 		return
 	}
 	a.files = files
+	if a.filesList != nil {
+		a.filesList.Refresh()
+	}
 }
 
 // getUniqueFilename returns a unique filename by adding numerical suffix if file exists
@@ -167,56 +285,119 @@ func itoa(n int) string {
 
 func (a *App) downloadFile(file api.FileInfo) {
 	basePath := filepath.Join(config.Current.DownloadFolder, file.Name)
-	downloadPath := getUniqueFilename(basePath)
+	var downloadPath string
+	var targetUnzipFolder string
+
+	if file.IsDirectory {
+		// Ensure the target folder for extraction is unique (e.g. "Folder (1)")
+		targetUnzipFolder = getUniqueFilename(basePath)
+		// Use a matching zip name for the temp file
+		downloadPath = targetUnzipFolder + ".zip"
+	} else {
+		downloadPath = getUniqueFilename(basePath)
+	}
+
 	os.MkdirAll(filepath.Dir(downloadPath), 0755)
 
 	a.statusText.Set("📥 Downloading...")
 
 	go func() {
-		encReader, err := a.apiClient.DownloadFile(file.Name, "fromphone")
+		reader, err := a.apiClient.DownloadFile(file.Name, "")
 		if err != nil {
 			log.Printf("Download failed: %v", err)
 			a.statusText.Set("🔴 Download failed")
 			return
 		}
-		defer encReader.Close()
+		defer reader.Close()
 
-		if filepath.Ext(file.Name) == ".zip" {
-			tempZip := downloadPath + ".temp"
-			tempFile, err := os.Create(tempZip)
-			if err != nil {
-				log.Printf("Create temp file failed: %v", err)
-				a.statusText.Set("🔴 Download failed")
-				return
-			}
-
-			if err := crypto.DecryptStream(tempFile, encReader, config.Current.PairingCode); err != nil {
-				tempFile.Close()
-				os.Remove(tempZip)
-				log.Printf("Decryption failed: %v", err)
-				a.statusText.Set("🔴 Decryption failed")
-				return
-			}
-			tempFile.Close()
-			os.Rename(tempZip, downloadPath)
-		} else {
-			destFile, err := os.Create(downloadPath)
-			if err != nil {
-				log.Printf("Create file failed: %v", err)
-				a.statusText.Set("🔴 Download failed")
-				return
-			}
-			defer destFile.Close()
-
-			if err := crypto.DecryptStream(destFile, encReader, config.Current.PairingCode); err != nil {
-				log.Printf("Decryption failed: %v", err)
-				a.statusText.Set("🔴 Decryption failed")
-				return
-			}
+		// Save stream to file
+		destFile, err := os.Create(downloadPath)
+		if err != nil {
+			log.Printf("Create file failed: %v", err)
+			a.statusText.Set("🔴 Download failed")
+			return
 		}
 
-		a.statusText.Set("✅ Downloaded: " + file.Name)
+		if _, err := io.Copy(destFile, reader); err != nil {
+			destFile.Close()
+			log.Printf("Download copy failed: %v", err)
+			a.statusText.Set("🔴 Download failed")
+			return
+		}
+		destFile.Close()
+
+		// If it was a directory download (zip), extract it and remove zip
+		if file.IsDirectory {
+			a.statusText.Set("📦 Extracting...")
+			// Remove .zip suffix to get target folder path
+			folderPath := strings.TrimSuffix(downloadPath, ".zip")
+
+			// Unzip to folderPath
+			if err := unzip(downloadPath, folderPath); err != nil {
+				log.Printf("Unzip failed: %v", err)
+				a.statusText.Set("🔴 Unzip failed: " + err.Error())
+				return
+			}
+
+			// Delete the zip file
+			os.Remove(downloadPath)
+			a.statusText.Set("✅ Downloaded: " + file.Name)
+		} else {
+			a.statusText.Set("✅ Downloaded: " + file.Name)
+		}
 	}()
+}
+
+// Helper to unzip a file
+func unzip(src, dest string) error {
+	r, err := zip.OpenReader(src)
+	if err != nil {
+		return err
+	}
+	defer r.Close()
+
+	os.MkdirAll(dest, 0755)
+
+	// Closure to address file descriptors issue with defer
+	extractAndWriteFile := func(f *zip.File) error {
+		rc, err := f.Open()
+		if err != nil {
+			return err
+		}
+		defer rc.Close()
+
+		path := filepath.Join(dest, f.Name)
+
+		// Check for ZipSlip (Directory traversal)
+		if !strings.HasPrefix(path, filepath.Clean(dest)+string(os.PathSeparator)) {
+			return fmt.Errorf("illegal file path: %s", path)
+		}
+
+		if f.FileInfo().IsDir() {
+			os.MkdirAll(path, f.Mode())
+		} else {
+			os.MkdirAll(filepath.Dir(path), f.Mode())
+			f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, f.Mode())
+			if err != nil {
+				return err
+			}
+			defer f.Close()
+
+			_, err = io.Copy(f, rc)
+			if err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+
+	for _, f := range r.File {
+		err := extractAndWriteFile(f)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (a *App) uploadFile() {
@@ -238,16 +419,10 @@ func (a *App) uploadFile() {
 			a.statusText.Set("🔴 Upload failed")
 			return
 		}
-		fileData, err := io.ReadAll(file)
-		file.Close()
-		if err != nil {
-			log.Printf("Read file failed: %v", err)
-			a.statusText.Set("🔴 Upload failed")
-			return
-		}
+		defer file.Close()
 
 		baseName := filepath.Base(filename)
-		if err := a.apiClient.UploadFile(baseName, bytes.NewReader(fileData)); err != nil {
+		if err := a.apiClient.UploadFile(baseName, file); err != nil {
 			log.Printf("Upload failed: %v", err)
 			a.statusText.Set("🔴 Upload failed")
 			return

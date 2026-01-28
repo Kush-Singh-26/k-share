@@ -21,7 +21,7 @@ data class LinkAddressInfo(val ip: String, val prefixLength: Int)
 object NetworkScanner {
 
     private const val WORKER_COUNT = 60
-    private const val CONNECT_TIMEOUT_MS = 150
+    private const val CONNECT_TIMEOUT_MS = 500
 
     // ==================== 1. CONNECTIVITY GATEKEEPER ====================
 
@@ -128,24 +128,19 @@ object NetworkScanner {
 
     // ==================== 3. QUICK PING ====================
 
-    private val quickPingClient = OkHttpClient.Builder()
-        .connectTimeout(200, TimeUnit.MILLISECONDS)
-        .readTimeout(200, TimeUnit.MILLISECONDS)
-        .build()
+    private fun getFastClient(timeoutMs: Long): OkHttpClient {
+        return OkHttpClient.Builder()
+            .connectTimeout(timeoutMs, TimeUnit.MILLISECONDS)
+            .readTimeout(timeoutMs, TimeUnit.MILLISECONDS)
+            .writeTimeout(timeoutMs, TimeUnit.MILLISECONDS)
+            .sslSocketFactory(ApiClient.getSslSocketFactory(), ApiClient.getTrustManager())
+            .hostnameVerifier { _, _ -> true }
+            .build()
+    }
 
     suspend fun quickPing(ip: String, port: Int, pairingCode: String): Boolean {
-        return withContext(Dispatchers.IO) {
-            try {
-                val request = Request.Builder().url("http://$ip:$port/ping").build()
-                quickPingClient.newCall(request).execute().use { response ->
-                    if (!response.isSuccessful) return@withContext false
-                    val body = response.body?.string() ?: return@withContext false
-                    ApiClient.verifyPingResponse(body, pairingCode)
-                }
-            } catch (e: Exception) {
-                false
-            }
-        }
+        // We ignore pairingCode for discovery ping (it's unauthenticated now)
+        return ApiClient.ping(ip, port).success
     }
 
     // ==================== 4. PRIORITY ZONE SCANNING ====================
@@ -261,34 +256,28 @@ object NetworkScanner {
         val found = AtomicReference<String?>(null)
         val cancelled = AtomicBoolean(false)
 
-        val scanClient = OkHttpClient.Builder()
-            .connectTimeout(CONNECT_TIMEOUT_MS.toLong(), TimeUnit.MILLISECONDS)
-            .readTimeout(CONNECT_TIMEOUT_MS.toLong(), TimeUnit.MILLISECONDS)
-            .build()
+        val scanClient = getFastClient(CONNECT_TIMEOUT_MS.toLong())
 
         // Launch worker pool
         val workers = List(WORKER_COUNT) {
             launch(Dispatchers.IO) {
                 for (ip in channel) {
-                    if (cancelled.get()) break // Stop processing immediately
+                    if (cancelled.get()) break 
                     
                     try {
-                        // TCP connect check
-                        Socket().use { socket ->
-                            socket.connect(InetSocketAddress(ip, port), CONNECT_TIMEOUT_MS)
-                        }
-                        
                         if (cancelled.get()) break
                         
                         // Application layer handshake
-                        val request = Request.Builder().url("http://$ip:$port/ping").build()
+                        val url = "https://$ip:$port/ping"
+                        
+                        val request = Request.Builder().url(url).build()
                         scanClient.newCall(request).execute().use { response ->
                             if (response.isSuccessful) {
                                 val body = response.body?.string()
-                                if (body != null && ApiClient.verifyPingResponse(body, pairingCode)) {
+                                if (body != null && body.contains("ok")) {
                                     if (found.compareAndSet(null, ip)) {
                                         cancelled.set(true)
-                                        channel.close() // Close channel to stop feeding
+                                        try { channel.close() } catch (e: Exception) {} 
                                     }
                                 }
                             }
@@ -332,17 +321,12 @@ object NetworkScanner {
         onStatus("Verifying $ip...")
         
         try {
-            // TCP connect check
-            Socket().use { socket ->
-                socket.connect(InetSocketAddress(ip, port), 500)
-            }
-            
-            // Ping handshake
+            // Ping handshake directly (Socket check causes TLS EOF errors)
             val success = quickPing(ip, port, pairingCode)
             if (success) {
                 onStatus("")
             } else {
-                onStatus("Invalid pairing code")
+                onStatus("Connection failed")
             }
             success
         } catch (e: Exception) {

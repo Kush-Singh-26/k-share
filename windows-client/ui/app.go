@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"k-share-client/api"
 	"k-share-client/config"
+	"os/exec"
+	"strings"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/app"
@@ -11,6 +13,7 @@ import (
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/data/binding"
 	"fyne.io/fyne/v2/layout"
+	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
 )
 
@@ -38,6 +41,17 @@ type App struct {
 
 	// Theme tracking
 	currentTheme string
+
+	// Clipboard Channel
+	clipboardChannel string
+
+	// Guest Mode UI
+	isGuest           bool
+	clipChannelSelect *widget.Select
+	clipGuestLabel    *widget.Label
+
+	// Connection state
+	isConnecting bool
 }
 
 func NewApp() *App {
@@ -63,6 +77,8 @@ func NewApp() *App {
 	a.pairingCode.Set(config.Current.PairingCode)
 	a.downloadFolder.Set(config.Current.DownloadFolder)
 	a.statusText.Set("🔴 Disconnected")
+	a.clipboardChannel = "" // Default to main
+	a.isGuest = false
 
 	return a
 }
@@ -73,14 +89,15 @@ func (a *App) Run() {
 
 	// Initialize API client
 	a.apiClient = api.NewClient(config.Current.ServerIP, config.Current.PairingCode)
-	a.wsClient = api.NewWSClient(config.Current.ServerIP)
+	a.wsClient = api.NewWSClient(config.Current.ServerIP, config.Current.PairingCode)
 
 	// Setup WebSocket callbacks
 	a.wsClient.OnClipUpdate = func() {
-		go func() {
-			a.fetchClipboard()
-		}()
+		if a.clipboardChannel == "" {
+			go a.fetchClipboard()
+		}
 	}
+
 	a.wsClient.OnHistoryUpdate = func() {
 		go func() {
 			a.loadHistory()
@@ -113,13 +130,23 @@ func (a *App) buildUI() fyne.CanvasObject {
 	mainContent := container.NewHSplit(clipboardPanel, filesPanel)
 	mainContent.SetOffset(0.35) // 35% clipboard, 65% files
 
-	return container.NewBorder(header, nil, nil, nil, mainContent)
+	// Dedicated stable Status Bar at the bottom
+	statusLabel := widget.NewLabelWithData(a.statusText)
+	statusLabel.Alignment = fyne.TextAlignCenter
+	statusLabel.TextStyle = fyne.TextStyle{Italic: true}
+
+	statusBar := container.NewVBox(
+		widget.NewSeparator(),
+		statusLabel,
+	)
+
+	return container.NewBorder(header, statusBar, nil, nil, mainContent)
 }
 
 func (a *App) buildHeader() fyne.CanvasObject {
 	// Server IP input
 	serverEntry := widget.NewEntryWithData(a.serverIP)
-	serverEntry.SetPlaceHolder("192.168.1.100:9823")
+	serverEntry.SetPlaceHolder("IP:Port (e.g. 192.168.1.10:26260)")
 	serverEntry.OnChanged = func(s string) {
 		config.Current.ServerIP = s
 		config.Save()
@@ -129,55 +156,41 @@ func (a *App) buildHeader() fyne.CanvasObject {
 	// Pairing code input
 	codeEntry := widget.NewPasswordEntry()
 	codeEntry.Bind(a.pairingCode)
-	codeEntry.SetPlaceHolder("Pairing Code")
+	codeEntry.SetPlaceHolder("Auth Code (Admin/Guest)")
 	codeEntry.OnChanged = func(s string) {
 		config.Current.PairingCode = s
 		config.Save()
-		a.apiClient.SetPairingCode(s)
+		a.apiClient.SetAuthCode(s)
 	}
 
 	// Connect button
-	a.connectBtn = widget.NewButton("Connect", func() {
-		// If IP is empty, try auto-discover
-		ip, _ := a.serverIP.Get()
-		if ip == "" {
-			a.autoDiscover()
-		} else {
-			a.connect()
-		}
+	a.connectBtn = widget.NewButtonWithIcon("Connect", resourceIconPng, func() {
+		a.connect()
 	})
+	a.connectBtn.Importance = widget.HighImportance
 
-	// Status label
-	statusLabel := widget.NewLabelWithData(a.statusText)
+	// Discover button
+	discoverBtn := widget.NewButton("🔍 Discover", func() {
+		a.autoDiscover()
+	})
 
 	// Download folder selector
 	folderLabel := widget.NewLabelWithData(a.downloadFolder)
 	folderLabel.Wrapping = fyne.TextTruncate
 
-	selectFolderBtn := widget.NewButton("📂 Select Download Folder", func() {
+	selectFolderBtn := widget.NewButton("📂 Folder", func() {
 		a.selectDownloadFolder()
 	})
 
-	row1 := container.NewBorder(nil, nil,
-		widget.NewLabel("Server:"),
-		container.NewHBox(a.connectBtn, statusLabel),
-		serverEntry,
-	)
-
-	row2 := container.NewBorder(nil, nil,
-		widget.NewLabel("Code:"),
-		selectFolderBtn,
-		codeEntry,
-	)
-
-	row3 := container.NewBorder(nil, nil,
-		widget.NewLabel("Downloads:"),
-		nil,
-		folderLabel,
-	)
+	openFolderBtn := widget.NewButton("Open", func() {
+		folder, _ := a.downloadFolder.Get()
+		if folder != "" {
+			exec.Command("explorer", folder).Start()
+		}
+	})
 
 	// Theme toggle button
-	themeToggle := widget.NewButton("🌓 Toggle Theme", func() {
+	themeToggle := widget.NewButton("🌓", func() {
 		if a.currentTheme == "light" {
 			a.fyneApp.Settings().SetTheme(&forcedDarkTheme{})
 			a.currentTheme = "dark"
@@ -187,9 +200,33 @@ func (a *App) buildHeader() fyne.CanvasObject {
 		}
 	})
 
+	// Settings/Saved Networks button
+	settingsBtn := widget.NewButton("⚙️", func() {
+		a.showSettingsPopup()
+	})
+
+	// STABLE LAYOUT CONSTRUCTION
+	// Theme toggle and Settings on the far right
+	topRow := container.NewHBox(layout.NewSpacer(), settingsBtn, themeToggle)
+
+	row1 := container.New(layout.NewFormLayout(),
+		widget.NewLabel("Server:"),
+		container.NewBorder(nil, nil, nil, container.NewHBox(discoverBtn, a.connectBtn), serverEntry),
+	)
+
+	row2 := container.New(layout.NewFormLayout(),
+		widget.NewLabel("Code:"),
+		codeEntry,
+	)
+
+	row3 := container.New(layout.NewFormLayout(),
+		widget.NewLabel("Save to:"),
+		container.NewBorder(nil, nil, nil, container.NewHBox(selectFolderBtn, openFolderBtn), folderLabel),
+	)
+
 	return container.NewVBox(
 		widget.NewSeparator(),
-		container.NewHBox(themeToggle, layout.NewSpacer()),
+		topRow,
 		row1,
 		row2,
 		row3,
@@ -201,6 +238,22 @@ func (a *App) buildClipboardPanel() fyne.CanvasObject {
 	// Header
 	titleLabel := widget.NewLabel("SHARED CLIPBOARD")
 	titleLabel.TextStyle = fyne.TextStyle{Bold: true}
+
+	// Channel Toggle (Admin)
+	a.clipChannelSelect = widget.NewSelect([]string{"My Clipboard", "Guest Clipboard"}, func(s string) {
+		if s == "Guest Clipboard" {
+			a.clipboardChannel = "guest"
+		} else {
+			a.clipboardChannel = ""
+		}
+		go a.fetchClipboard()
+	})
+	a.clipChannelSelect.SetSelected("My Clipboard")
+
+	// Guest Label (Guest)
+	a.clipGuestLabel = widget.NewLabel("Guest Mode (Shared)")
+	a.clipGuestLabel.TextStyle = fyne.TextStyle{Italic: true}
+	a.clipGuestLabel.Hide() // Hidden by default (assume admin until connect)
 
 	// Multiline text entry
 	clipEntry := widget.NewMultiLineEntry()
@@ -226,7 +279,10 @@ func (a *App) buildClipboardPanel() fyne.CanvasObject {
 
 	buttons := container.NewHBox(pushBtn, fetchBtn, copyBtn, historyBtn)
 
-	header := container.NewBorder(nil, nil, titleLabel, buttons)
+	header := container.NewVBox(
+		container.NewBorder(nil, nil, titleLabel, container.NewStack(a.clipChannelSelect, a.clipGuestLabel)),
+		buttons,
+	)
 
 	return container.NewBorder(
 		header,
@@ -275,28 +331,38 @@ func (a *App) buildFilesPanel() fyne.CanvasObject {
 			nameLabel := infoBox.Objects[0].(*widget.Label)
 			infoLabel := infoBox.Objects[1].(*widget.Label)
 
-			// Load thumbnail for images, show icon for others
-			if isImageFile(file.Name) && !file.IsDirectory {
-				// Register ownership of this widget to this file
-				a.setThumbnailTarget(thumbImg, file.Name)
-				// Clear old image immediately to prevent showing wrong image while loading
-				thumbImg.Image = nil
-				thumbImg.Refresh()
+			// Handle "Guest" prefix
+			displayName := file.Name
+			guestLabel := ""
+			if strings.HasPrefix(displayName, "Public/") {
+				displayName = strings.TrimPrefix(displayName, "Public/")
+				guestLabel = " [Guest]"
+			}
 
-				// Start async load
-				go a.loadThumbnail(file.Name, thumbImg)
+			// Load thumbnail for images, show icon for others
+			// We must use the REAL file name (with Public/) for thumbnails
+			if isImageFile(displayName) && !file.IsDirectory {
+				a.setThumbnailTarget(thumbImg, file.Name) // Use full name key
+				thumbImg.Image = nil
+				thumbImg.Resource = theme.FileImageIcon() // Placeholder until loaded
+				thumbImg.Refresh()
+				go a.loadThumbnail(file.Name, thumbImg) // Use full name for fetch
 			} else {
-				// Not an image, register as empty target
 				a.setThumbnailTarget(thumbImg, "")
 				thumbImg.Image = nil
+				if file.IsDirectory {
+					thumbImg.Resource = theme.FolderIcon()
+				} else {
+					thumbImg.Resource = getFileResource(displayName)
+				}
 				thumbImg.Refresh()
 			}
 
 			// Get appropriate icon based on file type
-			icon := getFileIcon(file.Name, file.IsDirectory)
+			icon := getFileIcon(displayName, file.IsDirectory)
 
-			// First line: icon + name
-			nameLabel.SetText(icon + " " + file.Name)
+			// First line: icon + name + tag
+			nameLabel.SetText(icon + " " + displayName + guestLabel)
 			nameLabel.TextStyle = fyne.TextStyle{Bold: true}
 
 			// Second line: size • timestamp (like Android)
@@ -318,10 +384,10 @@ func (a *App) buildFilesPanel() fyne.CanvasObject {
 	})
 
 	header := container.NewVBox(
-		widget.NewLabel("📤 Upload to Phone"),
+		widget.NewLabel("📤 Upload to server"),
 		uploadBtns,
 		widget.NewSeparator(),
-		widget.NewLabel("📥 Download from Phone (click to download)"),
+		widget.NewLabel("📥 Download from server (click to download)"),
 		refreshBtn,
 	)
 
@@ -396,6 +462,60 @@ func (a *App) showHistoryPopup() {
 	content := container.NewBorder(header, nil, nil, nil, scroll)
 	historyWindow.SetContent(content)
 	historyWindow.Show()
+}
+
+func (a *App) showSettingsPopup() {
+	settingsWindow := a.fyneApp.NewWindow("Saved Networks")
+	settingsWindow.Resize(fyne.NewSize(400, 300))
+
+	content := container.NewVBox()
+	content.Add(widget.NewLabelWithStyle("Saved Server IPs per Subnet", fyne.TextAlignCenter, fyne.TextStyle{Bold: true}))
+	content.Add(widget.NewSeparator())
+
+	if len(config.Current.SavedNetworks) == 0 {
+		content.Add(widget.NewLabel("No saved networks yet."))
+	}
+
+	for subnet, ip := range config.Current.SavedNetworks {
+		s, i := subnet, ip // capture
+		row := container.NewBorder(nil, nil, nil,
+			widget.NewButton("Delete", func() {
+				delete(config.Current.SavedNetworks, s)
+				config.Save()
+				settingsWindow.Close()
+				a.showSettingsPopup()
+			}),
+			container.NewVBox(
+				widget.NewLabel("Subnet: "+s),
+				widget.NewLabel("Last IP: "+i),
+			),
+		)
+		content.Add(row)
+		content.Add(widget.NewSeparator())
+	}
+
+	scroll := container.NewVScroll(content)
+	closeBtn := widget.NewButton("Close", func() { settingsWindow.Close() })
+
+	settingsWindow.SetContent(container.NewBorder(nil, closeBtn, nil, nil, scroll))
+	settingsWindow.Show()
+}
+
+func getFileResource(filename string) fyne.Resource {
+	lower := strings.ToLower(filename)
+	if strings.HasSuffix(lower, ".pdf") {
+		return theme.FileTextIcon()
+	}
+	if strings.HasSuffix(lower, ".mp3") || strings.HasSuffix(lower, ".wav") || strings.HasSuffix(lower, ".flac") {
+		return theme.FileAudioIcon()
+	}
+	if strings.HasSuffix(lower, ".mp4") || strings.HasSuffix(lower, ".avi") || strings.HasSuffix(lower, ".mkv") || strings.HasSuffix(lower, ".mov") {
+		return theme.FileVideoIcon()
+	}
+	if strings.HasSuffix(lower, ".zip") || strings.HasSuffix(lower, ".rar") || strings.HasSuffix(lower, ".7z") || strings.HasSuffix(lower, ".tar") {
+		return theme.StorageIcon()
+	}
+	return theme.FileIcon()
 }
 
 func formatSize(bytes int64) string {

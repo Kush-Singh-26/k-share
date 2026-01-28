@@ -2,7 +2,9 @@ package api
 
 import (
 	"encoding/json"
+	"k-share-client/crypto"
 	"log"
+	"net/http"
 	"strings"
 	"time"
 
@@ -15,6 +17,7 @@ type WSMessage struct {
 
 type WSClient struct {
 	serverIP        string
+	authCode        string
 	conn            *websocket.Conn
 	OnClipUpdate    func()
 	OnHistoryUpdate func()
@@ -22,24 +25,32 @@ type WSClient struct {
 	stopChan        chan struct{}
 }
 
-func NewWSClient(serverIP string) *WSClient {
+func NewWSClient(serverIP, authCode string) *WSClient {
 	return &WSClient{
 		serverIP: serverIP,
+		authCode: authCode,
 		stopChan: make(chan struct{}),
 	}
 }
 
 func (ws *WSClient) Connect() error {
 	// Construct WebSocket URL
-	wsURL := "ws://" + ws.serverIP + "/ws"
+	wsURL := "wss://" + ws.serverIP + "/ws"
+
+	// Use TOFU certificate pinning
+	dialer := *websocket.DefaultDialer
+	dialer.TLSClientConfig = crypto.CreateTLSConfig(nil)
 
 	var err error
-	ws.conn, _, err = websocket.DefaultDialer.Dial(wsURL, nil)
+	header := http.Header{}
+	header.Add("Authorization", "Bearer "+ws.authCode)
+
+	ws.conn, _, err = dialer.Dial(wsURL, header)
 	if err != nil {
 		return err
 	}
 
-	log.Println("WebSocket connected")
+	log.Println("WebSocket connected securely")
 	go ws.listen()
 	return nil
 }

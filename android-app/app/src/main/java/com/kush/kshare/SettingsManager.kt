@@ -4,6 +4,66 @@ import android.content.Context
 
 class SettingsManager(context: Context) {
     private val prefs = context.getSharedPreferences("settings", Context.MODE_PRIVATE)
+    private val serversKey = "known_servers"
+
+    data class ServerInfo(
+        val ip: String,
+        val port: Int,
+        val authCode: String,
+        val lastSeen: Long = System.currentTimeMillis()
+    )
+
+    fun getKnownServers(): Map<String, ServerInfo> {
+        val json = prefs.getString(serversKey, "{}") ?: "{}"
+        val map = mutableMapOf<String, ServerInfo>()
+        try {
+            val obj = org.json.JSONObject(json)
+            val keys = obj.keys()
+            while (keys.hasNext()) {
+                val hash = keys.next()
+                val serverObj = obj.getJSONObject(hash)
+                map[hash] = ServerInfo(
+                    serverObj.getString("ip"),
+                    serverObj.optInt("port", 26260),
+                    serverObj.getString("authCode"),
+                    serverObj.optLong("lastSeen", 0)
+                )
+            }
+        } catch (e: Exception) { e.printStackTrace() }
+        return map
+    }
+
+    fun saveServer(certHash: String, ip: String, port: Int, authCode: String) {
+        val servers = getKnownServers().toMutableMap()
+        servers[certHash] = ServerInfo(ip, port, authCode, System.currentTimeMillis())
+        
+        val json = org.json.JSONObject()
+        servers.forEach { (hash, info) ->
+            val serverObj = org.json.JSONObject()
+            serverObj.put("ip", info.ip)
+            serverObj.put("port", info.port)
+            serverObj.put("authCode", info.authCode)
+            serverObj.put("lastSeen", info.lastSeen)
+            json.put(hash, serverObj)
+        }
+        prefs.edit().putString(serversKey, json.toString()).apply()
+    }
+
+    fun removeServer(certHash: String) {
+        val servers = getKnownServers().toMutableMap()
+        if (servers.remove(certHash) != null) {
+            val json = org.json.JSONObject()
+            servers.forEach { (hash, info) ->
+                val serverObj = org.json.JSONObject()
+                serverObj.put("ip", info.ip)
+                serverObj.put("port", info.port)
+                serverObj.put("authCode", info.authCode)
+                serverObj.put("lastSeen", info.lastSeen)
+                json.put(hash, serverObj)
+            }
+            prefs.edit().putString(serversKey, json.toString()).apply()
+        }
+    }
 
     var serverIp: String
         get() = prefs.getString("server_ip", "") ?: ""

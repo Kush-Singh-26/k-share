@@ -6,12 +6,20 @@ import (
 	"path/filepath"
 )
 
+type ServerIdentity struct {
+	CertHash    string `json:"cert_hash"`
+	AuthCode    string `json:"auth_code"`
+	LastIP      string `json:"last_ip"`
+	DisplayName string `json:"display_name"`
+}
+
 type Config struct {
-	ServerIP          string            `json:"server_ip"`
-	PairingCode       string            `json:"pairing_code"`
-	DownloadFolder    string            `json:"download_folder"`
-	AutoSyncClipboard bool              `json:"auto_sync_clipboard"`
-	SavedNetworks     map[string]string `json:"saved_networks"`
+	ServerIP          string                    `json:"server_ip"`
+	PairingCode       string                    `json:"pairing_code"` // Fallback/Legacy
+	DownloadFolder    string                    `json:"download_folder"`
+	AutoSyncClipboard bool                      `json:"auto_sync_clipboard"`
+	SavedNetworks     map[string]string         `json:"saved_networks"`
+	KnownServers      map[string]ServerIdentity `json:"known_servers"`
 }
 
 var (

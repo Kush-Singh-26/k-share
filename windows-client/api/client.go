@@ -7,88 +7,101 @@ import (
 	"io"
 	"k-share-client/crypto"
 	"net/http"
+	"net/url"
 	"time"
 )
 
 type Client struct {
-	BaseURL     string
-	PairingCode string
-	HTTPClient  *http.Client
+	BaseURL    string
+	AuthCode   string
+	HTTPClient *http.Client
 }
 
-func NewClient(serverIP string, pairingCode string) *Client {
+func NewClient(serverIP string, authCode string) *Client {
+	// Use TOFU certificate pinning
+	tr := &http.Transport{
+		TLSClientConfig: crypto.CreateTLSConfig(nil),
+	}
 	return &Client{
-		BaseURL:     "http://" + serverIP,
-		PairingCode: pairingCode,
+		BaseURL:  "https://" + serverIP,
+		AuthCode: authCode,
 		HTTPClient: &http.Client{
-			Timeout: 30 * time.Second,
+			Timeout:   30 * time.Second,
+			Transport: tr,
 		},
 	}
 }
 
-func (c *Client) SetPairingCode(code string) {
-	c.PairingCode = code
+func (c *Client) SetAuthCode(code string) {
+	c.AuthCode = code
 }
 
 func (c *Client) SetServerIP(ip string) {
-	c.BaseURL = "http://" + ip
+	c.BaseURL = "https://" + ip
 }
 
-// Ping tests server connectivity
-func (c *Client) Ping() error {
-	resp, err := c.HTTPClient.Get(c.BaseURL + "/ping")
+// Ping tests server connectivity and returns role
+func (c *Client) Ping() (string, error) {
+	req, _ := http.NewRequest("GET", c.BaseURL+"/ping", nil)
+	// Send Auth to check role
+	req.Header.Set("Authorization", "Bearer "+c.AuthCode)
+
+	resp, err := c.HTTPClient.Do(req)
 	if err != nil {
-		return fmt.Errorf("connection failed: %w", err)
+		return "", fmt.Errorf("connection failed: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != 200 {
-		return fmt.Errorf("server returned status %d", resp.StatusCode)
-	}
-
-	body, _ := io.ReadAll(resp.Body)
-	data, err := crypto.DecryptData(string(body), c.PairingCode)
-	if err != nil {
-		return fmt.Errorf("decryption failed (wrong code?): %w", err)
+		return "", fmt.Errorf("server returned status %d", resp.StatusCode)
 	}
 
 	var result map[string]string
-	if err := json.Unmarshal(data, &result); err != nil {
-		return err
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return "", err
 	}
 
 	if result["status"] != "ok" {
-		return fmt.Errorf("server status not ok")
+		return "", fmt.Errorf("server status not ok")
 	}
 
-	return nil
+	return result["role"], nil // "admin", "guest", or "none"
 }
 
 // GetClipboard fetches current clipboard text from server
-func (c *Client) GetClipboard() (string, error) {
-	resp, err := c.HTTPClient.Get(c.BaseURL + "/clipboard")
+func (c *Client) GetClipboard(channel string) (string, error) {
+	url := c.BaseURL + "/clipboard"
+	if channel != "" {
+		url += "?channel=" + channel
+	}
+	req, _ := http.NewRequest("GET", url, nil)
+	req.Header.Set("Authorization", "Bearer "+c.AuthCode)
+
+	resp, err := c.HTTPClient.Do(req)
 	if err != nil {
 		return "", err
 	}
 	defer resp.Body.Close()
 
-	body, _ := io.ReadAll(resp.Body)
-	data, err := crypto.DecryptData(string(body), c.PairingCode)
+	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return "", err
 	}
 
-	return string(data), nil
+	return string(body), nil
 }
 
 // PushClipboard sends clipboard text to server
-func (c *Client) PushClipboard(text string) error {
-	encrypted, err := crypto.EncryptData([]byte(text), c.PairingCode)
-	if err != nil {
-		return err
+func (c *Client) PushClipboard(text string, channel string) error {
+	url := c.BaseURL + "/clipboard"
+	if channel != "" {
+		url += "?channel=" + channel
 	}
+	req, _ := http.NewRequest("POST", url, bytes.NewBufferString(text))
+	req.Header.Set("Authorization", "Bearer "+c.AuthCode)
+	req.Header.Set("Content-Type", "text/plain")
 
-	resp, err := c.HTTPClient.Post(c.BaseURL+"/clipboard", "text/plain", bytes.NewReader([]byte(encrypted)))
+	resp, err := c.HTTPClient.Do(req)
 	if err != nil {
 		return err
 	}
@@ -109,32 +122,37 @@ type FileInfo struct {
 	ModTime     string `json:"modTime"`
 }
 
-// ListFromPhoneFiles lists files in the server's from_phone directory
-func (c *Client) ListFromPhoneFiles() ([]FileInfo, error) {
-	resp, err := c.HTTPClient.Get(c.BaseURL + "/files/fromphone")
+// ListFiles lists files in the server's directory
+func (c *Client) ListFiles() ([]FileInfo, error) {
+	req, _ := http.NewRequest("GET", c.BaseURL+"/files", nil)
+	req.Header.Set("Authorization", "Bearer "+c.AuthCode)
+
+	resp, err := c.HTTPClient.Do(req)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
 
-	body, _ := io.ReadAll(resp.Body)
-	data, err := crypto.DecryptData(string(body), c.PairingCode)
-	if err != nil {
-		return nil, err
+	if resp.StatusCode != 200 {
+		return nil, fmt.Errorf("list files failed: server returned status %d", resp.StatusCode)
 	}
 
 	var files []FileInfo
-	if err := json.Unmarshal(data, &files); err != nil {
-		return nil, err
+	if err := json.NewDecoder(resp.Body).Decode(&files); err != nil {
+		return nil, fmt.Errorf("invalid json: %w", err)
 	}
 
 	return files, nil
 }
 
-// DownloadFile downloads an encrypted file from server and decrypts it
+// DownloadFile downloads a file from server
 func (c *Client) DownloadFile(filename string, folder string) (io.ReadCloser, error) {
-	url := fmt.Sprintf("%s/download/%s?folder=%s", c.BaseURL, filename, folder)
-	resp, err := c.HTTPClient.Get(url)
+	// Folder param is ignored by new server logic usually, but we keep signature for now
+	url := fmt.Sprintf("%s/download/%s", c.BaseURL, filename)
+	req, _ := http.NewRequest("GET", url, nil)
+	req.Header.Set("Authorization", "Bearer "+c.AuthCode)
+
+	resp, err := c.HTTPClient.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -147,16 +165,19 @@ func (c *Client) DownloadFile(filename string, folder string) (io.ReadCloser, er
 	return resp.Body, nil
 }
 
-// UploadFile uploads an encrypted file to server's to_phone directory
+// UploadFile uploads a file to server
 func (c *Client) UploadFile(filename string, reader io.Reader) error {
-	// Encrypt the stream
-	buf := &bytes.Buffer{}
-	if err := crypto.EncryptStream(buf, reader, c.PairingCode); err != nil {
-		return err
-	}
+	// Use net/url to escape the filename properly
+	baseURL, _ := url.Parse(c.BaseURL + "/upload")
+	params := url.Values{}
+	params.Add("name", filename)
+	baseURL.RawQuery = params.Encode()
 
-	url := fmt.Sprintf("%s/upload?folder=tophone&name=%s", c.BaseURL, filename)
-	resp, err := c.HTTPClient.Post(url, "application/octet-stream", buf)
+	req, _ := http.NewRequest("POST", baseURL.String(), reader)
+	req.Header.Set("Authorization", "Bearer "+c.AuthCode)
+	req.Header.Set("Content-Type", "application/octet-stream")
+
+	resp, err := c.HTTPClient.Do(req)
 	if err != nil {
 		return err
 	}
@@ -178,20 +199,17 @@ type HistoryItem struct {
 
 // GetHistory fetches clipboard history
 func (c *Client) GetHistory() ([]HistoryItem, error) {
-	resp, err := c.HTTPClient.Get(c.BaseURL + "/clipboard/history")
+	req, _ := http.NewRequest("GET", c.BaseURL+"/clipboard/history", nil)
+	req.Header.Set("Authorization", "Bearer "+c.AuthCode)
+
+	resp, err := c.HTTPClient.Do(req)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
 
-	body, _ := io.ReadAll(resp.Body)
-	data, err := crypto.DecryptData(string(body), c.PairingCode)
-	if err != nil {
-		return nil, err
-	}
-
 	var items []HistoryItem
-	if err := json.Unmarshal(data, &items); err != nil {
+	if err := json.NewDecoder(resp.Body).Decode(&items); err != nil {
 		return nil, err
 	}
 
@@ -204,6 +222,7 @@ func (c *Client) DeleteHistoryItem(id string) error {
 	if err != nil {
 		return err
 	}
+	req.Header.Set("Authorization", "Bearer "+c.AuthCode)
 
 	resp, err := c.HTTPClient.Do(req)
 	if err != nil {

@@ -9,6 +9,8 @@ import kotlinx.coroutines.withContext
 import java.io.File
 import java.io.FileOutputStream
 import java.net.URL
+import okhttp3.OkHttpClient
+import com.kush.kshare.api.ApiClient
 
 object ThumbnailCache {
     private val memoryCache: LruCache<String, Bitmap>
@@ -31,7 +33,7 @@ object ThumbnailCache {
 
     fun getFromMemory(key: String): Bitmap? = memoryCache.get(key)
 
-    suspend fun get(key: String, url: String): Bitmap? {
+    suspend fun get(key: String, url: String, pairingCode: String): Bitmap? {
         // 1. Memory
         memoryCache.get(key)?.let { return it }
 
@@ -51,16 +53,31 @@ object ThumbnailCache {
         }
 
         // 3. Network
+        // 3. Network
+        val client = OkHttpClient.Builder()
+            .sslSocketFactory(ApiClient.getSslSocketFactory(), ApiClient.getTrustManager())
+            .hostnameVerifier { _, _ -> true }
+            .build()
+            
         return withContext(Dispatchers.IO) {
             try {
-                val bitmap = BitmapFactory.decodeStream(URL(url).openStream())
-                if (bitmap != null) {
-                    memoryCache.put(key, bitmap)
-                    FileOutputStream(diskFile).use { out ->
-                        bitmap.compress(Bitmap.CompressFormat.JPEG, 80, out)
+                val request = okhttp3.Request.Builder()
+                    .url(url)
+                    .addHeader("Authorization", "Bearer $pairingCode")
+                    .build()
+                client.newCall(request).execute().use { response ->
+                    if (!response.isSuccessful) return@use null
+                    response.body?.byteStream()?.use { stream ->
+                        val bitmap = BitmapFactory.decodeStream(stream)
+                        if (bitmap != null) {
+                            memoryCache.put(key, bitmap)
+                            FileOutputStream(diskFile).use { out ->
+                                bitmap.compress(Bitmap.CompressFormat.JPEG, 80, out)
+                            }
+                        }
+                        bitmap
                     }
                 }
-                bitmap
             } catch (e: Exception) {
                 null
             }

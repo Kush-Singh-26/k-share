@@ -51,6 +51,8 @@ class FileTransferService : Service() {
         super.onCreate()
         createNotificationChannel()
         acquireWifiLock()
+        // Ensure ApiClient is initialized (safe to call multiple times if we check, but init re-creates client checking context is cheap)
+        try { ApiClient.init(applicationContext) } catch (e: Exception) { e.printStackTrace() }
     }
 
     private fun startForegroundCompat(id: Int, notification: Notification) {
@@ -159,35 +161,57 @@ class FileTransferService : Service() {
             try {
                 val treeUri = Uri.parse(treeUriString)
                 val rootDoc = DocumentFile.fromTreeUri(this@FileTransferService, treeUri) ?: throw Exception("Failed to open folder")
-                val files = mutableListOf<Pair<DocumentFile, String>>()
                 
-                fun scan(doc: DocumentFile, path: String) {
-                    val name = doc.name ?: return
+                var totalFiles = 0
+                var successCount = 0
+                var currentFileIndex = 0
+
+                // Phase 1: Count files (optional, but good for progress)
+                suspend fun count(doc: DocumentFile) {
                     if (doc.isDirectory) {
-                        doc.listFiles().forEach { scan(it, "$path$name/") }
+                        for (file in doc.listFiles()) {
+                            count(file)
+                        }
                     } else {
-                        files.add(doc to "$path$name")
+                        totalFiles++
                     }
                 }
                 
-                val rootName = rootDoc.name ?: "Folder"
-                rootDoc.listFiles().forEach { scan(it, "$rootName/") }
+                updateNotification(1, "Counting files...")
+                count(rootDoc)
 
-                if (files.isEmpty()) {
+                if (totalFiles == 0) {
                     withContext(Dispatchers.Main) { showCompletionNotification(System.currentTimeMillis().toInt(), "Folder is empty") }
                     return@launch
                 }
 
-                var successCount = 0
-                files.forEachIndexed { index, (file, relPath) ->
-                    updateNotification(1, "Uploading (${index + 1}/${files.size}): ${file.name}")
-                    val inputStream = contentResolver.openInputStream(file.uri) ?: return@forEachIndexed
-                    val success = ApiClient.uploadFile(serverIp, serverPort, inputStream, relPath, pairingCode, file.length()) { _, _ -> }
-                    if (success) successCount++
+                // Phase 2: Immediate Upload
+                suspend fun scanAndUpload(doc: DocumentFile, path: String) {
+                    if (!isActive) return
+                    val name = doc.name ?: return
+                    if (doc.isDirectory) {
+                        for (file in doc.listFiles()) {
+                            scanAndUpload(file, "$path$name/")
+                        }
+                    } else {
+                        currentFileIndex++
+                        updateNotification(1, "Uploading ($currentFileIndex/$totalFiles): $name")
+                        try {
+                            val inputStream = contentResolver.openInputStream(doc.uri) ?: return
+                            val success = ApiClient.uploadFile(serverIp, serverPort, inputStream, "$path$name", pairingCode, doc.length()) { _, _ -> }
+                            if (success) successCount++
+                        } catch (e: Exception) { e.printStackTrace() }
+                    }
+                }
+                
+                val rootName = rootDoc.name ?: "Folder"
+                // Start scan from children of rootDoc to match previous logic
+                for (file in rootDoc.listFiles()) {
+                    scanAndUpload(file, "$rootName/")
                 }
                 
                 withContext(Dispatchers.Main) { 
-                    showCompletionNotification(System.currentTimeMillis().toInt(), "Uploaded $successCount/${files.size} files from ${rootDoc.name}") 
+                    showCompletionNotification(System.currentTimeMillis().toInt(), "Uploaded $successCount/$totalFiles files from $rootName") 
                 }
             } catch (e: Exception) {
                 withContext(Dispatchers.Main) { showCompletionNotification(System.currentTimeMillis().toInt(), "Folder upload error: ${e.message}") }
@@ -212,10 +236,16 @@ class FileTransferService : Service() {
                     if (isDir) {
                         val tempZip = File(cacheDir, "download_${System.currentTimeMillis()}.zip")
                         FileOutputStream(tempZip).use { output ->
-                            ApiClient.decryptStream(encryptedStream, output, pairingCode) { downloaded ->
+                            val input = encryptedStream
+                            val buffer = ByteArray(64 * 1024)
+                            var totalRead = 0L
+                            var read: Int
+                            while (input.read(buffer).also { read = it } != -1) {
+                                output.write(buffer, 0, read)
+                                totalRead += read
                                 val currentTime = System.currentTimeMillis()
                                 if (currentTime - startTime > 1000) {
-                                    val progress = if (total > 0) (downloaded * 100 / total).toInt() else -1
+                                    val progress = if (total > 0) (totalRead * 100 / total).toInt() else -1
                                     updateNotification(3, "Downloading folder: ${if (progress >= 0) "$progress%" else ""}")
                                     startTime = currentTime
                                 }
@@ -267,10 +297,16 @@ class FileTransferService : Service() {
                                 
                                 contentResolver.openOutputStream(newFile.uri).use { output ->
                                     if (output == null) throw Exception("Failed to open output")
-                                    ApiClient.decryptStream(encryptedStream, output, pairingCode) { downloaded ->
+                                    val input = encryptedStream
+                                    val buffer = ByteArray(64 * 1024)
+                                    var totalRead = 0L
+                                    var read: Int
+                                    while (input.read(buffer).also { read = it } != -1) {
+                                        output.write(buffer, 0, read)
+                                        totalRead += read
                                         val currentTime = System.currentTimeMillis()
                                         if (currentTime - startTime > 1000) {
-                                            val progress = if (total > 0) (downloaded * 100 / total).toInt() else -1
+                                            val progress = if (total > 0) (totalRead * 100 / total).toInt() else -1
                                             updateNotification(3, "Downloading: ${if (progress >= 0) "$progress%" else ""}")
                                             startTime = currentTime
                                         }
@@ -292,10 +328,16 @@ class FileTransferService : Service() {
                             }
 
                             FileOutputStream(outputFile).use { output ->
-                                ApiClient.decryptStream(encryptedStream, output, pairingCode) { downloaded ->
+                                val input = encryptedStream
+                                val buffer = ByteArray(64 * 1024)
+                                var totalRead = 0L
+                                var read: Int
+                                while (input.read(buffer).also { read = it } != -1) {
+                                    output.write(buffer, 0, read)
+                                    totalRead += read
                                     val currentTime = System.currentTimeMillis()
                                     if (currentTime - startTime > 1000) {
-                                        val progress = if (total > 0) (downloaded * 100 / total).toInt() else -1
+                                        val progress = if (total > 0) (totalRead * 100 / total).toInt() else -1
                                         updateNotification(3, "Downloading: ${if (progress >= 0) "$progress%" else ""}")
                                         startTime = currentTime
                                     }

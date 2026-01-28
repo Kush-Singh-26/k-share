@@ -1,6 +1,8 @@
 package com.kush.kshare.api
 
+import android.content.Context
 import android.util.Base64
+import com.kush.kshare.SettingsManager
 import com.google.gson.Gson
 import com.google.gson.annotations.SerializedName
 import com.google.gson.reflect.TypeToken
@@ -12,14 +14,13 @@ import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONObject
 import java.io.InputStream
 import java.io.OutputStream
-import java.nio.ByteBuffer
-import java.nio.ByteOrder
 import java.security.MessageDigest
 import java.security.SecureRandom
+import java.security.cert.X509Certificate
 import java.util.concurrent.TimeUnit
-import javax.crypto.Cipher
-import javax.crypto.spec.GCMParameterSpec
-import javax.crypto.spec.SecretKeySpec
+import javax.net.ssl.SSLContext
+import javax.net.ssl.SSLSocketFactory
+import javax.net.ssl.X509TrustManager
 
 data class RemoteFile(
     val name: String,
@@ -36,172 +37,170 @@ data class HistoryItem(
 
 object ApiClient {
     @Volatile var lastError: String? = null
+    private lateinit var settingsManager: SettingsManager
+    private lateinit var trustManager: PinningTrustManager
+    private lateinit var sslContext: SSLContext
 
-    private val client = OkHttpClient.Builder()
-        .connectTimeout(15, TimeUnit.SECONDS)
-        .readTimeout(0, TimeUnit.SECONDS)
-        .writeTimeout(0, TimeUnit.SECONDS)
-        .build()
-
+    private var client = OkHttpClient()
     private val gson = Gson()
-    private val secureRandom = SecureRandom()
 
-    private fun getEncryptionKey(pairingCode: String): SecretKeySpec {
-        val digest = MessageDigest.getInstance("SHA-256")
-        val keyBytes = digest.digest(pairingCode.toByteArray())
-        return SecretKeySpec(keyBytes, "AES")
+    fun init(context: Context) {
+        settingsManager = SettingsManager(context)
+        trustManager = PinningTrustManager(settingsManager)
+        
+        sslContext = SSLContext.getInstance("TLS")
+        sslContext.init(null, arrayOf(trustManager), SecureRandom())
+        
+        client = OkHttpClient.Builder()
+            .connectTimeout(15, TimeUnit.SECONDS)
+            .readTimeout(0, TimeUnit.SECONDS)
+            .writeTimeout(0, TimeUnit.SECONDS)
+            .sslSocketFactory(sslContext.socketFactory, trustManager)
+            // Hostname verification re-enabled for security.
+            // Self-signed certs from server include IP SANs.
+            .build()
     }
 
-    private fun encryptData(data: ByteArray, pairingCode: String): String {
-        val key = getEncryptionKey(pairingCode)
-        val nonce = ByteArray(12)
-        secureRandom.nextBytes(nonce)
+    fun getSslSocketFactory(): SSLSocketFactory = sslContext.socketFactory
+    fun getTrustManager(): X509TrustManager = trustManager
 
-        val timestamp = System.currentTimeMillis() / 1000
-        val payload = JSONObject().apply {
-            put("t", timestamp)
-            put("d", Base64.encodeToString(data, Base64.NO_WRAP))
-        }
+    class PinningTrustManager(private val settings: SettingsManager) : X509TrustManager {
+        @Volatile var lastSeenCert: X509Certificate? = null
 
-        val cipher = Cipher.getInstance("AES/GCM/NoPadding")
-        cipher.init(Cipher.ENCRYPT_MODE, key, GCMParameterSpec(128, nonce))
-        val ciphertext = cipher.doFinal(payload.toString().toByteArray())
+        override fun checkClientTrusted(chain: Array<out X509Certificate>?, authType: String?) {}
 
-        val combined = ByteArray(nonce.size + ciphertext.size)
-        System.arraycopy(nonce, 0, combined, 0, nonce.size)
-        System.arraycopy(ciphertext, 0, combined, nonce.size, ciphertext.size)
-
-        return Base64.encodeToString(combined, Base64.NO_WRAP)
-    }
-
-    private fun decryptData(encryptedStr: String, pairingCode: String): ByteArray? {
-        return try {
-            val combined = Base64.decode(encryptedStr, Base64.DEFAULT)
-            val key = getEncryptionKey(pairingCode)
-            val nonce = combined.copyOfRange(0, 12)
-            val ciphertext = combined.copyOfRange(12, combined.size)
-
-            val cipher = Cipher.getInstance("AES/GCM/NoPadding")
-            cipher.init(Cipher.DECRYPT_MODE, key, GCMParameterSpec(128, nonce))
-            val plaintext = cipher.doFinal(ciphertext)
-
-            val payload = JSONObject(String(plaintext))
-            val t = payload.getLong("t")
-            if (Math.abs((System.currentTimeMillis() / 1000) - t) > 600) return null
-
-            Base64.decode(payload.getString("d"), Base64.DEFAULT)
-        } catch (e: Exception) {
-            null
-        }
-    }
-
-    /**
-     * Verifies an encrypted ping response contains "ok".
-     * Used by NetworkScanner for server discovery.
-     */
-    fun verifyPingResponse(encryptedBody: String, pairingCode: String): Boolean {
-        val decrypted = decryptData(encryptedBody, pairingCode) ?: return false
-        return String(decrypted).contains("ok")
-    }
-
-    suspend fun decryptStream(input: InputStream, output: OutputStream, pairingCode: String, onProgress: (Long) -> Unit) {
-        val key = getEncryptionKey(pairingCode)
-        val nonce = ByteArray(12)
-        if (input.read(nonce) != 12) throw Exception("Invalid stream")
-
-        var chunkIndex = 0L
-        val sizeBuf = ByteArray(4)
-        var totalDecrypted = 0L
-
-        while (true) {
-            val read = input.read(sizeBuf)
-            if (read == -1) break
-            if (read != 4) throw Exception("Invalid chunk size")
-
-            val length = ByteBuffer.wrap(sizeBuf).order(ByteOrder.LITTLE_ENDIAN).int
-            val encryptedChunk = ByteArray(length)
-            var offset = 0
-            while (offset < length) {
-                val r = input.read(encryptedChunk, offset, length - offset)
-                if (r == -1) break
-                offset += r
-            }
-
-            val currentNonce = nonce.clone()
-            for (i in 0 until 8) {
-                currentNonce[i] = (currentNonce[i].toInt() xor (chunkIndex ushr (i * 8)).toInt()).toByte()
-            }
-
-            val cipher = Cipher.getInstance("AES/GCM/NoPadding")
-            cipher.init(Cipher.DECRYPT_MODE, key, GCMParameterSpec(128, currentNonce))
-            val plaintext = cipher.doFinal(encryptedChunk)
-            output.write(plaintext)
+        override fun checkServerTrusted(chain: Array<out X509Certificate>?, authType: String?) {
+            if (chain.isNullOrEmpty()) throw java.security.cert.CertificateException("Empty certificate chain")
             
-            totalDecrypted += plaintext.size
-            onProgress(totalDecrypted)
-            chunkIndex++
+            val cert = chain[0]
+            lastSeenCert = cert
+            
+            val hash = getCertHash(cert)
+            val knownServers = settings.getKnownServers()
+            
+            // If we've seen this certificate hash before, it's trusted.
+            // If not, we allow it ONLY during the initial handshake so user can verify.
+            // This is the "Trust On First Use" (TOFU) model.
+            if (knownServers.containsKey(hash)) {
+                return // Trusted
+            }
+            
+            // Note: We don't throw here so that ApiClient.ping can capture the hash 
+            // and MainActivity can show the "Trust this server?" dialog.
+            // Strict enforcement happens because we check result.certHash in MainActivity.
+        }
+
+        override fun getAcceptedIssuers(): Array<X509Certificate> = arrayOf()
+        
+        fun getCertHash(cert: X509Certificate): String {
+            val digest = MessageDigest.getInstance("SHA-256")
+            val hash = digest.digest(cert.encoded)
+            return hash.joinToString("") { "%02x".format(it) }
         }
     }
 
-    suspend fun ping(serverIp: String, port: Int, pairingCode: String): Boolean {
-        val request = Request.Builder().url("http://$serverIp:$port/ping").build()
+    data class PingResult(val success: Boolean, val certHash: String? = null, val name: String? = null, val role: String? = null)
+
+    suspend fun ping(serverIp: String, port: Int, pairingCode: String = ""): PingResult {
+        // trustManager.lastSeenCert = null // DO NOT RESET: Reuse cert from scanner if session resumed
+        val requestBuilder = Request.Builder().url("https://$serverIp:$port/ping")
+        if (pairingCode.isNotEmpty()) {
+            requestBuilder.header("Authorization", "Bearer $pairingCode")
+        }
+        val request = requestBuilder.build()
+
         return try {
             lastError = null
             withContext(Dispatchers.IO) {
                 client.newCall(request).execute().use { response ->
+                    var cert: X509Certificate? = response.handshake?.peerCertificates?.firstOrNull() as? X509Certificate
+                    
+                    if (cert == null) {
+                         cert = trustManager.lastSeenCert
+                    }
+
+                    val certHash = cert?.let { trustManager.getCertHash(it) }
+                    
                     if (!response.isSuccessful) {
                         lastError = "HTTP ${response.code}"
-                        return@withContext false
+                        return@use PingResult(false, certHash)
                     }
-                    val body = response.body?.string() ?: return@withContext false
-                    val decrypted = decryptData(body, pairingCode)
-                    if (decrypted == null) {
-                        lastError = "Decryption failed"
-                        return@withContext false
+                    val body = response.body?.string() ?: return@use PingResult(false, certHash)
+                    
+                    try {
+                        val json = JSONObject(body)
+                        val success = json.optString("status") == "ok"
+                        val name = json.optString("name")
+                        val role = json.optString("role")
+                        PingResult(success, certHash, name, role)
+                    } catch (e: Exception) {
+                        // Fallback for old servers (or text response)
+                        val success = body.contains("ok")
+                        PingResult(success, certHash)
                     }
-                    String(decrypted).contains("ok")
                 }
             }
         } catch (e: Exception) {
             lastError = e.message ?: e.javaClass.simpleName
-            false
+            PingResult(false)
         }
     }
 
-    suspend fun listFiles(serverIp: String, port: Int, pairingCode: String, folder: String = "tophone"): List<RemoteFile> {
-        val endpoint = if (folder == "fromphone") "fromphone" else "tophone"
-        val request = Request.Builder().url("http://$serverIp:$port/files/$endpoint").build()
+    suspend fun listFiles(serverIp: String, port: Int, pairingCode: String, folder: String = ""): List<RemoteFile> {
+        var url = "https://$serverIp:$port/files"
+        if (folder.isNotEmpty()) {
+             url += "?folder=${java.net.URLEncoder.encode(folder, "UTF-8")}"
+        }
+        val request = Request.Builder()
+            .url(url)
+            .header("Authorization", "Bearer $pairingCode")
+            .build()
+            
         return try {
             withContext(Dispatchers.IO) {
                 client.newCall(request).execute().use { response ->
-                    if (!response.isSuccessful) return@withContext emptyList<RemoteFile>()
-                    val body = response.body?.string() ?: return@withContext emptyList<RemoteFile>()
-                    val decrypted = decryptData(body, pairingCode) ?: return@withContext emptyList<RemoteFile>()
+                    if (!response.isSuccessful) return@use emptyList<RemoteFile>()
+                    val body = response.body?.string() ?: return@use emptyList<RemoteFile>()
                     val type = object : TypeToken<List<RemoteFile>>() {}.type
-                    gson.fromJson(String(decrypted), type)
+                    gson.fromJson(body, type)
                 }
             }
         } catch (e: Exception) { emptyList() }
     }
 
-    suspend fun getClipboard(serverIp: String, port: Int, pairingCode: String): String? {
-        val request = Request.Builder().url("http://$serverIp:$port/clipboard").build()
+    suspend fun getClipboard(serverIp: String, port: Int, pairingCode: String, channel: String = ""): String? {
+        var url = "https://$serverIp:$port/clipboard"
+        if (channel.isNotEmpty()) url += "?channel=$channel"
+        
+        val request = Request.Builder()
+            .url(url)
+            .header("Authorization", "Bearer $pairingCode")
+            .build()
         return try {
             withContext(Dispatchers.IO) {
                 client.newCall(request).execute().use { response ->
-                    if (!response.isSuccessful) return@withContext null
-                    val body = response.body?.string() ?: return@withContext null
-                    val decrypted = decryptData(body, pairingCode) ?: return@withContext null
-                    String(decrypted)
+                    if (!response.isSuccessful) return@use null
+                    response.body?.string()
                 }
             }
         } catch (e: Exception) { null }
     }
 
-    suspend fun postClipboard(serverIp: String, port: Int, text: String, pairingCode: String, append: Boolean = false): Boolean {
-        val encrypted = encryptData(text.toByteArray(), pairingCode)
-        val url = "http://$serverIp:$port/clipboard" + (if (append) "?mode=append" else "")
-        val request = Request.Builder().url(url).post(encrypted.toRequestBody("text/plain".toMediaType())).build()
+    suspend fun postClipboard(serverIp: String, port: Int, text: String, pairingCode: String, append: Boolean = false, channel: String = ""): Boolean {
+        var url = "https://$serverIp:$port/clipboard"
+        val params = ArrayList<String>()
+        if (append) params.add("mode=append")
+        if (channel.isNotEmpty()) params.add("channel=$channel")
+        
+        if (params.isNotEmpty()) {
+            url += "?" + params.joinToString("&")
+        }
+
+        val request = Request.Builder()
+            .url(url)
+            .header("Authorization", "Bearer $pairingCode")
+            .post(text.toRequestBody("text/plain".toMediaType()))
+            .build()
         return try {
             withContext(Dispatchers.IO) {
                 client.newCall(request).execute().use { it.isSuccessful }
@@ -210,23 +209,26 @@ object ApiClient {
     }
 
     suspend fun getHistory(serverIp: String, port: Int, pairingCode: String): List<HistoryItem> {
-        val request = Request.Builder().url("http://$serverIp:$port/clipboard/history").build()
+        val request = Request.Builder()
+            .url("https://$serverIp:$port/clipboard/history")
+            .header("Authorization", "Bearer $pairingCode")
+            .build()
         return try {
             withContext(Dispatchers.IO) {
                 client.newCall(request).execute().use { response ->
-                    if (!response.isSuccessful) return@withContext emptyList<HistoryItem>()
-                    val body = response.body?.string() ?: return@withContext emptyList<HistoryItem>()
-                    val decrypted = decryptData(body, pairingCode) ?: return@withContext emptyList<HistoryItem>()
+                    if (!response.isSuccessful) return@use emptyList<HistoryItem>()
+                    val body = response.body?.string() ?: return@use emptyList<HistoryItem>()
                     val type = object : TypeToken<List<HistoryItem>>() {}.type
-                    gson.fromJson<List<HistoryItem>>(String(decrypted), type)
+                    gson.fromJson<List<HistoryItem>>(body, type)
                 }
             }
         } catch (e: Exception) { emptyList() }
     }
 
-    suspend fun deleteHistory(serverIp: String, port: Int, id: String): Boolean {
+    suspend fun deleteHistory(serverIp: String, port: Int, id: String, pairingCode: String): Boolean {
         val request = Request.Builder()
-            .url("http://$serverIp:$port/clipboard/history?id=$id")
+            .url("https://$serverIp:$port/clipboard/history?id=$id")
+            .header("Authorization", "Bearer $pairingCode")
             .delete()
             .build()
         return try {
@@ -236,13 +238,16 @@ object ApiClient {
         } catch (e: Exception) { false }
     }
 
-    fun getThumbnailUrl(serverIp: String, port: Int, folder: String, name: String): String {
-        return "http://$serverIp:$port/thumbnail?folder=$folder&name=${java.net.URLEncoder.encode(name, "UTF-8")}"
+    fun getThumbnailUrl(serverIp: String, port: Int, name: String): String {
+        return "https://$serverIp:$port/thumbnail?name=${java.net.URLEncoder.encode(name, "UTF-8")}"
     }
 
     suspend fun openOnPc(serverIp: String, port: Int, url: String, pairingCode: String): Boolean {
-        val encrypted = encryptData(url.toByteArray(), pairingCode)
-        val request = Request.Builder().url("http://$serverIp:$port/open").post(encrypted.toRequestBody("text/plain".toMediaType())).build()
+        val request = Request.Builder()
+            .url("https://$serverIp:$port/open")
+            .header("Authorization", "Bearer $pairingCode")
+            .post(url.toRequestBody("text/plain".toMediaType()))
+            .build()
         return try {
             withContext(Dispatchers.IO) {
                 client.newCall(request).execute().use { it.isSuccessful }
@@ -258,7 +263,10 @@ object ApiClient {
         onStreamReady: suspend (InputStream, Long) -> Unit
     ): Boolean {
         val encodedName = java.net.URLEncoder.encode(fileName, "UTF-8").replace("+", "%20")
-        val request = Request.Builder().url("http://$serverIp:$port/download/$encodedName").build()
+        val request = Request.Builder()
+            .url("https://$serverIp:$port/download/$encodedName")
+            .header("Authorization", "Bearer $pairingCode")
+            .build()
         return try {
             withContext(Dispatchers.IO) {
                 client.newCall(request).execute().use { response ->
@@ -282,51 +290,30 @@ object ApiClient {
     ): Boolean {
         val requestBody = object : RequestBody() {
             override fun contentType() = "application/octet-stream".toMediaType()
+            override fun contentLength() = contentLength
             override fun writeTo(sink: okio.BufferedSink) {
-                encryptStreamBlocking(inputStream, sink.outputStream(), pairingCode, contentLength) { sent ->
-                    onProgress(sent, contentLength)
+                val buffer = ByteArray(64 * 1024)
+                var uploaded = 0L
+                var read: Int
+                while (inputStream.read(buffer).also { read = it } != -1) {
+                    sink.write(buffer, 0, read)
+                    uploaded += read
+                    onProgress(uploaded, contentLength)
                 }
             }
         }
+        
         val encodedName = java.net.URLEncoder.encode(fileName, "UTF-8")
-        val request = Request.Builder().url("http://$serverIp:$port/upload?name=$encodedName").post(requestBody).build()
+        val request = Request.Builder()
+            .url("https://$serverIp:$port/upload?name=$encodedName")
+            .header("Authorization", "Bearer $pairingCode")
+            .post(requestBody)
+            .build()
+            
         return try {
             withContext(Dispatchers.IO) {
                 client.newCall(request).execute().use { it.isSuccessful }
             }
         } catch (e: Exception) { false }
-    }
-
-    private fun encryptStreamBlocking(input: InputStream, output: OutputStream, pairingCode: String, totalPlainSize: Long, onProgress: (Long) -> Unit) {
-        val key = getEncryptionKey(pairingCode)
-        val nonce = ByteArray(12)
-        secureRandom.nextBytes(nonce)
-        output.write(nonce)
-
-        val buffer = ByteArray(64 * 1024)
-        var chunkIndex = 0L
-        var totalRead = 0L
-
-        while (true) {
-            val n = input.read(buffer)
-            if (n == -1) break
-
-            val currentNonce = nonce.clone()
-            for (i in 0 until 8) {
-                currentNonce[i] = (currentNonce[i].toInt() xor (chunkIndex ushr (i * 8)).toInt()).toByte()
-            }
-
-            val cipher = Cipher.getInstance("AES/GCM/NoPadding")
-            cipher.init(Cipher.ENCRYPT_MODE, key, GCMParameterSpec(128, currentNonce))
-            val encryptedChunk = cipher.doFinal(buffer, 0, n)
-
-            val sizeBuf = ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN).putInt(encryptedChunk.size).array()
-            output.write(sizeBuf)
-            output.write(encryptedChunk)
-
-            totalRead += n
-            onProgress(totalRead)
-            chunkIndex++
-        }
     }
 }

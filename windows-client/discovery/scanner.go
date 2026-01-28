@@ -2,6 +2,7 @@ package discovery
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"k-share-client/config"
 	"math/rand"
@@ -14,7 +15,7 @@ import (
 
 const (
 	WorkerCount      = 255 // Fast parallel scan for laptops
-	ConnectTimeoutMs = 200
+	ConnectTimeoutMs = 350 // Balance between speed and reliability on slow networks
 )
 
 // FindServer scans for the server on local network
@@ -90,8 +91,7 @@ func FindServer(port int, pairingCode string, onStatus func(string)) string {
 		}
 	}
 
-	// Shuffle IPs to avoid rate limiting
-	rand.Seed(time.Now().UnixNano())
+	// Shuffle IPs to avoid rate limiting (Go 1.20+ auto-seeds)
 	rand.Shuffle(len(ipsToScan), func(i, j int) {
 		ipsToScan[i], ipsToScan[j] = ipsToScan[j], ipsToScan[i]
 	})
@@ -110,12 +110,16 @@ func FindServer(port int, pairingCode string, onStatus func(string)) string {
 				Timeout: ConnectTimeoutMs * time.Millisecond,
 			}
 
-			for ip := range jobs {
+			// Context-aware select to prevent goroutine leak
+			for {
 				select {
 				case <-ctx.Done():
 					return
-				default:
-					if checkTarget(client, ip, port, pairingCode) {
+				case ip, ok := <-jobs:
+					if !ok {
+						return
+					}
+					if checkTarget(ctx, client, ip, port, pairingCode) {
 						select {
 						case foundIP <- ip:
 						case <-ctx.Done():
@@ -171,20 +175,28 @@ func checkIP(ctx context.Context, ip string, port int, pairingCode string) bool 
 	client := &http.Client{
 		Timeout: ConnectTimeoutMs * time.Millisecond,
 	}
-	return checkTarget(client, ip, port, pairingCode)
+	return checkTarget(ctx, client, ip, port, pairingCode)
 }
 
-func checkTarget(client *http.Client, ip string, port int, pairingCode string) bool {
-	// TCP Dial first (FAST)
-	conn, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", ip, port), ConnectTimeoutMs*time.Millisecond)
+func checkTarget(ctx context.Context, client *http.Client, ip string, port int, pairingCode string) bool {
+	// Configure client for HTTPS with self-signed certs if not already configured
+	if transport, ok := client.Transport.(*http.Transport); !ok || transport == nil {
+		tr := &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+		}
+		client.Transport = tr
+	} else if transport.TLSClientConfig == nil {
+		transport.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
+	}
+
+	// HTTPS Application Ping (Verify)
+	url := fmt.Sprintf("https://%s:%d/ping", ip, port)
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
 		return false
 	}
-	conn.Close()
 
-	// HTTP Application Ping (Verify)
-	url := fmt.Sprintf("http://%s:%d/ping", ip, port)
-	resp, err := client.Get(url)
+	resp, err := client.Do(req)
 	if err != nil {
 		return false
 	}
@@ -194,15 +206,5 @@ func checkTarget(client *http.Client, ip string, port int, pairingCode string) b
 		return false
 	}
 
-	// Here we could strictly verify the pairing code payload like Android does
-	// checking api.Client logic. For now, a 200 OK from /ping is a strong signal
-	// but strictly we should decrypt.
-	// Re-using api logic slightly adapted:
-	// In a real optimized scanner, we might just trust the port open + /ping 200
-	// to avoid crypto overhead during high-speed scan, but to be sure:
-
-	// Create a temp client to reuse existing verification logic is safest but slower.
-	// For robust discovery, we'll assume if it speaks K-Share protocol (200 OK on /ping),
-	// it's likely our server. The actual Connect() call will verify the code.
 	return true
 }

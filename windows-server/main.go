@@ -3,15 +3,17 @@ package main
 import (
 	"archive/zip"
 	"bytes"
-	"crypto/aes"
-	"crypto/cipher"
 	"crypto/rand"
+	"crypto/rsa"
 	"crypto/sha256"
-	_ "embed" // Embed support
-	"encoding/base64"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	_ "embed"
 	"encoding/binary"
-	"encoding/hex" // Added for thumbnail cache hashing
+	"encoding/hex"
 	"encoding/json"
+	"encoding/pem"
 	"fmt"
 	"image"
 	"image/color"
@@ -20,6 +22,7 @@ import (
 	"image/png"
 	"io"
 	"log"
+	"math/big"
 	"net"
 	"net/http"
 	"os"
@@ -36,10 +39,10 @@ import (
 )
 
 type Config struct {
-	Port        string `json:"port"`
-	FromPhone   string `json:"from_phone_dir"`
-	ToPhone     string `json:"to_phone_dir"`
-	PairingCode string `json:"pairing_code"`
+	Port      string `json:"port"`
+	SharedDir string `json:"shared_dir"`
+	AdminCode string `json:"admin_code"`
+	GuestCode string `json:"guest_code"`
 }
 
 type FileInfo struct {
@@ -64,7 +67,7 @@ var (
 	clipboardMutex sync.Mutex
 	hub            *Hub
 	lastKnownIP    string
-	cacheDir       string // Added for thumbnail caching
+	cacheDir       string
 )
 
 func init() {
@@ -78,7 +81,7 @@ func init() {
 	os.MkdirAll(cacheDir, 0755)
 }
 
-// --- 🔌 WEBSOCKET HUB ---
+// Hub manages WebSocket connections for real-time updates
 type Hub struct {
 	clients    map[*websocket.Conn]bool
 	broadcast  chan []byte
@@ -142,7 +145,7 @@ func handleWS(w http.ResponseWriter, r *http.Request) {
 	hub.register <- conn
 }
 
-// --- 🔐 ENCRYPTION HELPERS ---
+// Utilities
 func getAppDir() string {
 	exe, err := os.Executable()
 	if err != nil {
@@ -163,7 +166,7 @@ func setupLogging() {
 	}
 	multi := io.MultiWriter(f, os.Stdout)
 	log.SetOutput(multi)
-	log.Println("🚀 --- K-Share Encrypted Server Started ---")
+	log.Println("🚀 --- K-Share Secure Server Started (HTTPS) ---")
 }
 
 func loadConfig() {
@@ -179,140 +182,57 @@ func loadConfig() {
 	}
 }
 
-func getEncryptionKey() []byte {
-	hash := sha256.Sum256([]byte(appConfig.PairingCode))
-	return hash[:]
+// Auth & Role-based access control
+func getRole(r *http.Request) string {
+	auth := r.Header.Get("Authorization")
+	if auth == "" {
+		return "none"
+	}
+	code := strings.TrimPrefix(auth, "Bearer ")
+	if code == appConfig.AdminCode {
+		return "admin"
+	}
+	if code == appConfig.GuestCode {
+		return "guest"
+	}
+	return "none"
 }
 
-func encryptData(data []byte) (string, error) {
-	key := getEncryptionKey()
-	block, err := aes.NewCipher(key)
-	if err != nil {
-		return "", err
+func getEffectiveRoot(r *http.Request) (string, error) {
+	role := getRole(r)
+	if role == "admin" {
+		return appConfig.SharedDir, nil
 	}
-	gcm, _ := cipher.NewGCM(block)
-	nonce := make([]byte, gcm.NonceSize())
-	io.ReadFull(rand.Reader, nonce)
-
-	timestamp := time.Now().Unix()
-	payload := map[string]interface{}{
-		"t": timestamp,
-		"d": base64.StdEncoding.EncodeToString(data),
+	if role == "guest" {
+		p := filepath.Join(appConfig.SharedDir, "Public")
+		os.MkdirAll(p, 0755)
+		return p, nil
 	}
-	jsonPayload, _ := json.Marshal(payload)
-	ciphertext := gcm.Seal(nonce, nonce, jsonPayload, nil)
-	return base64.StdEncoding.EncodeToString(ciphertext), nil
+	return "", fmt.Errorf("unauthorized")
 }
 
-func decryptData(encryptedStr string) ([]byte, error) {
-	ciphertext, err := base64.StdEncoding.DecodeString(encryptedStr)
-	if err != nil {
-		return nil, err
+func requireAuth(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if getRole(r) == "none" {
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			return
+		}
+		next(w, r)
 	}
-	key := getEncryptionKey()
-	block, err := aes.NewCipher(key)
-	if err != nil {
-		return nil, err
-	}
-	gcm, _ := cipher.NewGCM(block)
-	nonceSize := gcm.NonceSize()
-	if len(ciphertext) < nonceSize {
-		return nil, fmt.Errorf("ciphertext too short")
-	}
-	nonce, ciphertext := ciphertext[:nonceSize], ciphertext[nonceSize:]
-	plaintext, err := gcm.Open(nil, nonce, ciphertext, nil)
-	if err != nil {
-		return nil, err
-	}
-	var payload map[string]interface{}
-	json.Unmarshal(plaintext, &payload)
-	if t, ok := payload["t"].(float64); ok {
-		if time.Now().Unix()-int64(t) > 600 {
-			return nil, fmt.Errorf("message expired")
-		}
-	}
-	dataStr, _ := payload["d"].(string)
-	return base64.StdEncoding.DecodeString(dataStr)
-}
-
-func encryptStream(dst io.Writer, src io.Reader) error {
-	key := getEncryptionKey()
-	block, _ := aes.NewCipher(key)
-	gcm, _ := cipher.NewGCM(block)
-	nonce := make([]byte, gcm.NonceSize())
-	io.ReadFull(rand.Reader, nonce)
-	dst.Write(nonce)
-
-	buf := make([]byte, chunkSize)
-	chunkIndex := uint64(0)
-	for {
-		n, err := src.Read(buf)
-		if n > 0 {
-			currentNonce := make([]byte, len(nonce))
-			copy(currentNonce, nonce)
-			for i := 0; i < 8; i++ {
-				currentNonce[i] ^= byte(chunkIndex >> (i * 8))
-			}
-			encrypted := gcm.Seal(nil, currentNonce, buf[:n], nil)
-			sizeBuf := make([]byte, 4)
-			sizeBuf[0], sizeBuf[1], sizeBuf[2], sizeBuf[3] = byte(len(encrypted)), byte(len(encrypted)>>8), byte(len(encrypted)>>16), byte(len(encrypted)>>24)
-			dst.Write(sizeBuf)
-			dst.Write(encrypted)
-			chunkIndex++
-		}
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func decryptStream(dst io.Writer, src io.Reader) error {
-	key := getEncryptionKey()
-	block, _ := aes.NewCipher(key)
-	gcm, _ := cipher.NewGCM(block)
-	nonce := make([]byte, gcm.NonceSize())
-	if _, err := io.ReadFull(src, nonce); err != nil {
-		return err
-	}
-	chunkIndex := uint64(0)
-	sizeBuf := make([]byte, 4)
-	for {
-		_, err := io.ReadFull(src, sizeBuf)
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			return err
-		}
-		length := uint32(sizeBuf[0]) | uint32(sizeBuf[1])<<8 | uint32(sizeBuf[2])<<16 | uint32(sizeBuf[3])<<24
-		encrypted := make([]byte, length)
-		if _, err := io.ReadFull(src, encrypted); err != nil {
-			return err
-		}
-		currentNonce := make([]byte, len(nonce))
-		copy(currentNonce, nonce)
-		for i := 0; i < 8; i++ {
-			currentNonce[i] ^= byte(chunkIndex >> (i * 8))
-		}
-		plaintext, err := gcm.Open(nil, currentNonce, encrypted, nil)
-		if err != nil {
-			return err
-		}
-		dst.Write(plaintext)
-		chunkIndex++
-	}
-	return nil
 }
 
 func handlePing(w http.ResponseWriter, r *http.Request) {
-	data, _ := json.Marshal(map[string]string{"status": "ok", "mode": "encrypted"})
-	enc, _ := encryptData(data)
 	w.Header().Set("Access-Control-Allow-Origin", "*")
-	w.Write([]byte(enc))
+	w.Header().Set("Content-Type", "application/json")
+
+	role := getRole(r) // "admin", "guest", or "none" (if no auth header)
+
+	json.NewEncoder(w).Encode(map[string]string{
+		"status": "ok",
+		"name":   "K-Share Server",
+		"proto":  "https",
+		"role":   role,
+	})
 }
 
 func handleUpload(w http.ResponseWriter, r *http.Request) {
@@ -320,15 +240,22 @@ func handleUpload(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+
+	// Auth Check
+	rootDir, err := getEffectiveRoot(r)
+	if err != nil {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
 	filename := r.URL.Query().Get("name")
 	if filename == "" {
 		filename = "upload_" + time.Now().Format("20060102_150405")
 	}
-	dir := appConfig.FromPhone
-	if r.URL.Query().Get("folder") == "tophone" {
-		dir = appConfig.ToPhone
-	}
-	destPath := filepath.Join(dir, filename)
+
+	destPath := filepath.Join(rootDir, filename)
+	// Ensure unique filename to prevent overwrite
+	destPath = getUniqueFilenameServer(destPath)
 
 	// Create parent directories if they don't exist
 	if err := os.MkdirAll(filepath.Dir(destPath), 0755); err != nil {
@@ -342,69 +269,109 @@ func handleUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer destFile.Close()
-	log.Printf("📥 Receiving Encrypted: %s -> %s\n", filename, dir)
-	err = decryptStream(destFile, r.Body)
+	log.Printf("📥 Receiving Stream: %s -> %s\n", filename, rootDir)
+
+	// Stream request body directly to file
+	_, err = io.Copy(destFile, r.Body)
 	if err != nil {
-		log.Printf("❌ Decrypt failed: %v\n", err)
-		http.Error(w, "Decrypt failed", http.StatusBadRequest)
+		log.Printf("❌ Upload failed: %v\n", err)
+		http.Error(w, "Upload failed", http.StatusInternalServerError)
 		return
 	}
-	log.Printf("✅ Received & Decrypted: %s\n", filename)
+	log.Printf("✅ Received: %s\n", filename)
 	notifyChange("files")
 }
 
-func handleListFiles(w http.ResponseWriter, r *http.Request, dir string) {
-	entries, err := os.ReadDir(dir)
+func handleListFiles(w http.ResponseWriter, r *http.Request) {
+	// Auth Check
+	rootDir, err := getEffectiveRoot(r)
 	if err != nil {
-		log.Printf("❌ Failed to read directory %s: %v\n", dir, err)
-		entries = []os.DirEntry{}
-	}
-
-	var files []FileInfo
-	for _, entry := range entries {
-		info, err := entry.Info()
-		if err != nil {
-			continue
-		}
-		files = append(files, FileInfo{
-			Name:        info.Name(),
-			IsDirectory: info.IsDir(),
-			Size:        info.Size(),
-			ModTime:     info.ModTime().Format("2006-01-02 15:04:05"),
-		})
-	}
-	log.Printf("📂 Listing %d items from %s\n", len(files), dir)
-	data, _ := json.Marshal(files)
-	enc, err := encryptData(data)
-	if err != nil {
-		http.Error(w, "Encryption failed", http.StatusInternalServerError)
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
 		return
 	}
+
+	role := getRole(r)
+	var files []FileInfo
+
+	// Helper to read a directory
+	readDir := func(path string, prefix string) {
+		entries, err := os.ReadDir(path)
+		if err != nil {
+			return
+		}
+		for _, entry := range entries {
+			info, err := entry.Info()
+			if err != nil {
+				continue
+			}
+			// Skip valid items
+			name := info.Name()
+			if name == "Public" && prefix == "" {
+				continue
+			} // Skip Public folder itself in root listing
+
+			files = append(files, FileInfo{
+				Name:        prefix + name,
+				IsDirectory: info.IsDir(),
+				Size:        info.Size(),
+				ModTime:     info.ModTime().Format("2006-01-02 15:04:05"),
+			})
+		}
+	}
+
+	// 1. Read Root
+	readDir(rootDir, "")
+
+	// 2. If Admin, also read Public and prefix with "Public/"
+	if role == "admin" {
+		publicDir := filepath.Join(rootDir, "Public")
+		readDir(publicDir, "Public/")
+	}
+
 	w.Header().Set("Access-Control-Allow-Origin", "*")
-	w.Write([]byte(enc))
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(files)
 }
 
 func handleClipboard(w http.ResponseWriter, r *http.Request) {
-	clipboardPath := filepath.Join(getAppDir(), "clipboard.txt")
+	role := getRole(r)
+	channel := r.URL.Query().Get("channel") // "guest" or empty (default)
+
+	// Determine target file
+	var targetFile string
+
+	if role == "guest" {
+		// Guest is forced to use guest clipboard
+		targetFile = "guest_clipboard.txt"
+	} else if role == "admin" {
+		if channel == "guest" {
+			targetFile = "guest_clipboard.txt"
+		} else {
+			targetFile = "clipboard.txt"
+		}
+	} else {
+		http.Error(w, "Forbidden", http.StatusForbidden)
+		return
+	}
+
+	clipboardPath := filepath.Join(getAppDir(), targetFile)
+
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+
 	if r.Method == http.MethodOptions {
 		return
 	}
 	clipboardMutex.Lock()
 	defer clipboardMutex.Unlock()
+
 	if r.Method == http.MethodGet {
 		data, _ := os.ReadFile(clipboardPath)
-		enc, _ := encryptData(data)
-		w.Write([]byte(enc))
+		w.Write(data)
 	} else if r.Method == http.MethodPost {
 		body, _ := io.ReadAll(r.Body)
-		data, err := decryptData(string(body))
-		if err != nil {
-			http.Error(w, "Decrypt failed", http.StatusForbidden)
-			return
-		}
+		data := body // Plain text over TLS
+
 		mode := r.URL.Query().Get("mode")
 		var finalData []byte
 		if mode == "append" {
@@ -419,11 +386,19 @@ func handleClipboard(w http.ResponseWriter, r *http.Request) {
 			finalData = data
 		}
 		os.WriteFile(clipboardPath, finalData, 0644)
-		addToHistory(string(data))
-		log.Println("📋 Clipboard updated")
+		if targetFile == "clipboard.txt" {
+			addToHistory(string(data))
+		}
+		log.Printf("📋 Clipboard updated (%s)", targetFile)
 		w.WriteHeader(http.StatusOK)
-		notifyChange("clip")
-		notifyChange("history")
+
+		// Notify based on channel
+		if targetFile == "guest_clipboard.txt" {
+			notifyChange("clip_guest")
+		} else {
+			notifyChange("clip")
+			notifyChange("history")
+		}
 	}
 }
 
@@ -431,6 +406,12 @@ func handleHistory(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Header().Set("Access-Control-Allow-Methods", "GET, DELETE, OPTIONS")
 	if r.Method == http.MethodOptions {
+		return
+	}
+
+	// SECURITY: Clipboard history is admin-only
+	if getRole(r) != "admin" {
+		http.Error(w, "Forbidden", http.StatusForbidden)
 		return
 	}
 
@@ -458,35 +439,28 @@ func handleHistory(w http.ResponseWriter, r *http.Request) {
 	}
 
 	history, _ := os.ReadFile(historyPath)
-	var items []HistoryItem
-	json.Unmarshal(history, &items)
-
-	// Self-healing: Assign IDs to old items if they are 0
-	changed := false
-	for i := range items {
-		if items[i].ID == "" || items[i].ID == "0" {
-			items[i].ID = fmt.Sprintf("%d", items[i].Timestamp.UnixNano())
-			changed = true
-		}
-	}
-	if changed {
-		data, _ := json.Marshal(items)
-		os.WriteFile(historyPath, data, 0644)
-	}
-
-	data, _ := json.Marshal(items)
-	enc, _ := encryptData(data)
-	w.Write([]byte(enc))
+	w.Header().Set("Content-Type", "application/json")
+	w.Write(history)
 }
 
 func handleThumbnail(w http.ResponseWriter, r *http.Request) {
-	folder := r.URL.Query().Get("folder")
 	name := r.URL.Query().Get("name")
-	dir := appConfig.ToPhone
-	if folder == "fromphone" {
-		dir = appConfig.FromPhone
+	folder := r.URL.Query().Get("folder")
+
+	// Auth Check
+	dir, err := getEffectiveRoot(r)
+	if err != nil {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
 	}
-	filePath := filepath.Join(dir, name)
+
+	// Sanitize path to prevent directory traversal
+	relPath := filepath.Join(folder, name)
+	if strings.Contains(relPath, "..") {
+		http.Error(w, "Invalid path", http.StatusBadRequest)
+		return
+	}
+	filePath := filepath.Join(dir, relPath)
 
 	// 1. Check if source file exists
 	info, err := os.Stat(filePath)
@@ -551,13 +525,9 @@ func handleOpen(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	body, _ := io.ReadAll(r.Body)
-	url, err := decryptData(string(body))
-	if err != nil {
-		http.Error(w, "Decrypt failed", http.StatusForbidden)
-		return
-	}
-	log.Printf("🌐 Opening URL on PC: %s\n", string(url))
-	exec.Command("rundll32", "url.dll,FileProtocolHandler", string(url)).Start()
+	url := string(body)
+	log.Printf("🌐 Opening URL on PC: %s\n", url)
+	exec.Command("rundll32", "url.dll,FileProtocolHandler", url).Start()
 	w.WriteHeader(http.StatusOK)
 }
 
@@ -615,6 +585,49 @@ func startIPMonitor() {
 			lastKnownIP = currentIP
 		}
 	}
+}
+
+func generateSelfSignedCert() {
+	if _, err := os.Stat("cert.pem"); err == nil {
+		if _, err := os.Stat("key.pem"); err == nil {
+			return // Already exists
+		}
+	}
+	log.Println("🔐 Generating self-signed TLS certificate...")
+
+	priv, _ := rsa.GenerateKey(rand.Reader, 2048)
+	template := x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject: pkix.Name{
+			Organization: []string{"K-Share Self-Signed"},
+		},
+		NotBefore: time.Now(),
+		NotAfter:  time.Now().Add(365 * 24 * time.Hour),
+
+		KeyUsage:              x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		BasicConstraintsValid: true,
+	}
+
+	// Add all IPs to SANs
+	addrs, _ := net.InterfaceAddrs()
+	for _, addr := range addrs {
+		if ipnet, ok := addr.(*net.IPNet); ok {
+			template.IPAddresses = append(template.IPAddresses, ipnet.IP)
+		}
+	}
+	template.IPAddresses = append(template.IPAddresses, net.ParseIP("127.0.0.1"))
+
+	derBytes, _ := x509.CreateCertificate(rand.Reader, &template, &template, &priv.PublicKey, priv)
+
+	certOut, _ := os.Create("cert.pem")
+	pem.Encode(certOut, &pem.Block{Type: "CERTIFICATE", Bytes: derBytes})
+	certOut.Close()
+
+	keyOut, _ := os.Create("key.pem")
+	pem.Encode(keyOut, &pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(priv)})
+	keyOut.Close()
+	log.Println("✅ Certificate generated.")
 }
 
 //go:embed Icon.png
@@ -699,6 +712,40 @@ func generateIcon() []byte {
 	return ico.Bytes()
 }
 
+func getUniqueFilenameServer(basePath string) string {
+	if _, err := os.Stat(basePath); os.IsNotExist(err) {
+		return basePath
+	}
+
+	dir := filepath.Dir(basePath)
+	ext := filepath.Ext(basePath)
+	nameWithoutExt := filepath.Base(basePath)
+	if len(ext) > 0 {
+		nameWithoutExt = nameWithoutExt[:len(nameWithoutExt)-len(ext)]
+	}
+
+	counter := 1
+	for {
+		newPath := filepath.Join(dir, nameWithoutExt+" ("+itoa(counter)+")"+ext)
+		if _, err := os.Stat(newPath); os.IsNotExist(err) {
+			return newPath
+		}
+		counter++
+	}
+}
+
+func itoa(n int) string {
+	if n == 0 {
+		return "0"
+	}
+	result := ""
+	for n > 0 {
+		result = string(rune('0'+n%10)) + result
+		n /= 10
+	}
+	return result
+}
+
 func onReady() {
 	systray.SetTitle("K-Share")
 	systray.SetTooltip("K-Share-Server: Encrypted Local Sharing")
@@ -710,11 +757,26 @@ func onReady() {
 
 	mIP := systray.AddMenuItem("IP: "+getOutboundIP().String(), "")
 	mIP.Disable()
+
+	systray.AddSeparator()
+
+	mRefreshIP := systray.AddMenuItem("Refresh IP", "Check for IP changes")
+	mOpenShared := systray.AddMenuItem("Open Shared Folder", "Open storage location")
+
+	systray.AddSeparator()
 	mExit := systray.AddMenuItem("Exit", "Quit K-Share")
 
 	go func() {
 		for {
 			select {
+			case <-mOpenShared.ClickedCh:
+				exec.Command("explorer", appConfig.SharedDir).Start()
+
+			case <-mRefreshIP.ClickedCh:
+				newIP := getOutboundIP()
+				mIP.SetTitle("IP: " + newIP.String())
+				log.Printf("🔄 Manual IP Refresh: %s\n", newIP.String())
+
 			case <-mExit.ClickedCh:
 				systray.Quit()
 				os.Exit(0)
@@ -747,93 +809,108 @@ func main() {
 	loadConfig()
 	hub = newHub()
 	go hub.run()
-	os.MkdirAll(appConfig.FromPhone, 0755)
-	os.MkdirAll(appConfig.ToPhone, 0755)
+
+	// Create Shared Dir
+	if err := os.MkdirAll(appConfig.SharedDir, 0755); err != nil {
+		log.Printf("❌ Failed to create SharedDir: %v", err)
+	}
+
 	localIP := getOutboundIP()
 	lastKnownIP = localIP.String()
 	log.Printf("📡 Local IP: %s\n", localIP)
 	go startIPMonitor()
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/ws", handleWS)
+	mux.HandleFunc("/ws", handleWS) // WS handles its own auth inside
 	mux.HandleFunc("/ping", handlePing)
-	mux.HandleFunc("/upload", handleUpload)
-	mux.HandleFunc("/open", handleOpen)
-	mux.HandleFunc("/thumbnail", handleThumbnail)
-	mux.HandleFunc("/clipboard/history", handleHistory)
-	mux.HandleFunc("/files/tophone", func(w http.ResponseWriter, r *http.Request) { handleListFiles(w, r, appConfig.ToPhone) })
-	mux.HandleFunc("/files/fromphone", func(w http.ResponseWriter, r *http.Request) { handleListFiles(w, r, appConfig.FromPhone) })
-	mux.HandleFunc("/download/", func(w http.ResponseWriter, r *http.Request) {
-		path := r.URL.Path
-		filename := filepath.Base(path)
+	mux.HandleFunc("/upload", requireAuth(handleUpload))
+	mux.HandleFunc("/open", requireAuth(handleOpen))
+	mux.HandleFunc("/thumbnail", requireAuth(handleThumbnail))
+	mux.HandleFunc("/clipboard", requireAuth(handleClipboard))
+	mux.HandleFunc("/clipboard/history", requireAuth(handleHistory))
+	mux.HandleFunc("/files", requireAuth(handleListFiles))
 
-		dir := appConfig.ToPhone
-		if r.URL.Query().Get("folder") == "fromphone" {
-			dir = appConfig.FromPhone
+	mux.HandleFunc("/download/", requireAuth(func(w http.ResponseWriter, r *http.Request) {
+		path := r.URL.Path
+		// /download/filename.ext or /download/subfolder/filename.ext
+		relPath := strings.TrimPrefix(path, "/download/")
+
+		rootDir, err := getEffectiveRoot(r)
+		if err != nil {
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			return
 		}
-		fullPath := filepath.Join(dir, filename)
+
+		// Secure path validation: join first, then validate canonical path
+		fullPath := filepath.Join(rootDir, filepath.Clean(relPath))
+		absPath, err := filepath.Abs(fullPath)
+		if err != nil {
+			http.Error(w, "Invalid path", http.StatusBadRequest)
+			return
+		}
+		absRoot, _ := filepath.Abs(rootDir)
+		// Ensure the resolved path is within the allowed root directory
+		if !strings.HasPrefix(absPath, absRoot+string(filepath.Separator)) && absPath != absRoot {
+			http.Error(w, "Access denied", http.StatusForbidden)
+			return
+		}
+
 		info, err := os.Stat(fullPath)
 		if err != nil {
-			log.Printf("❌ Download failed: %s not found in %s\n", filename, dir)
 			http.Error(w, "File not found", http.StatusNotFound)
 			return
 		}
 
 		if info.IsDir() {
-			pr, pw := io.Pipe()
-			go func() {
-				defer pw.Close()
-				zw := zip.NewWriter(pw)
-				defer zw.Close()
-				filepath.Walk(fullPath, func(path string, info os.FileInfo, err error) error {
-					if err != nil {
-						return err
-					}
-					relPath, _ := filepath.Rel(fullPath, path)
-					if relPath == "." {
-						return nil
-					}
-					// Standardize slashes for ZIP entries (Android expects forward slashes)
-					relPath = filepath.ToSlash(relPath)
-
-					if info.IsDir() {
-						_, err := zw.Create(relPath + "/")
-						return err
-					}
-
-					f, err := os.Open(path)
-					if err != nil {
-						return err
-					}
-					defer f.Close()
-					w, err := zw.Create(relPath)
-					if err != nil {
-						return err
-					}
-					_, err = io.Copy(w, f)
+			// Zip folder
+			w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s.zip\"", filepath.Base(fullPath)))
+			zw := zip.NewWriter(w)
+			defer zw.Close()
+			filepath.Walk(fullPath, func(path string, info os.FileInfo, err error) error {
+				if err != nil {
 					return err
-				})
-			}()
-			w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s.zip.enc\"", filename))
-			log.Printf("📤 Sending Encrypted Folder (as Zip): %s\n", filename)
-			encryptStream(w, pr)
+				}
+				rel, _ := filepath.Rel(fullPath, path)
+				if rel == "." {
+					return nil
+				}
+				// Ensure ZIP uses forward slashes (standard) even on Windows
+				rel = filepath.ToSlash(rel)
+				if info.IsDir() {
+					_, err = zw.Create(rel + "/")
+					return err
+				}
+				f, err := os.Open(path)
+				if err != nil {
+					return err
+				}
+				defer f.Close()
+				dest, err := zw.Create(rel)
+				if err != nil {
+					return err
+				}
+				_, err = io.Copy(dest, f)
+				return err
+			})
 		} else {
-			file, err := os.Open(fullPath)
-			if err != nil {
-				http.Error(w, "File not found", http.StatusNotFound)
-				return
-			}
-			defer file.Close()
-			w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s.enc\"", filename))
-			log.Printf("📤 Sending Encrypted File: %s\n", filename)
-			encryptStream(w, file)
+			// Serve File
+			w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s\"", filepath.Base(fullPath)))
+			http.ServeFile(w, r, fullPath)
 		}
-	})
-	mux.HandleFunc("/clipboard", handleClipboard)
+	}))
+
+	// Generate certs if needed
+	generateSelfSignedCert()
 
 	go func() {
-		server := &http.Server{Addr: ":" + appConfig.Port, Handler: mux}
-		log.Fatal(server.ListenAndServe())
+		// Use HTTPS
+		server := &http.Server{
+			Addr:    ":" + appConfig.Port,
+			Handler: mux,
+		}
+		log.Printf("🔒 Server listening on https://%s:%s", "0.0.0.0", appConfig.Port)
+		// Enable TLS 1.3 explicitly if needed, but default is good.
+		log.Fatal(server.ListenAndServeTLS("cert.pem", "key.pem"))
 	}()
 
 	systray.Run(onReady, onExit)
@@ -899,49 +976,34 @@ func sendToPhone(filePath string) {
 	loadConfig()
 
 	// Detect if it's a file or folder
-	info, err := os.Stat(filePath)
+	_, err := os.Stat(filePath)
 	if err != nil {
 		log.Fatalf("❌ File check failed: %v", err)
 	}
 
-	url := fmt.Sprintf("http://localhost:%s/upload?name=%s", appConfig.Port, filepath.Base(filePath))
-	if info.IsDir() {
-		// Just trigger UI to show it's unsupported or handle folder upload if implemented via CLI?
-		// For now, let's just say we support file sending via this simple CLI trigger.
-		// To support folder, we'd need to zip it first or use the /upload endpoint recursively?
-		// Actually, the server /upload endpoint handles streams.
-		// Making a CLI uploader is complex.
-		// A simpler way: Just launch the GUI app if not running?
-		// Or send a signal to the running app?
+	url := fmt.Sprintf("https://localhost:%s/upload?name=%s", appConfig.Port, filepath.Base(filePath))
+
+	// Skip verification for local CLI
+	tr := &http.Transport{
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
 	}
+	client := &http.Client{Transport: tr}
 
-	// Real implementation:
-	// We should probably just trigger the upload to the LOCAL server directly via HTTP.
+	file, err := os.Open(filePath)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer file.Close()
 
-	// Create pipe for streaming
-	pr, pw := io.Pipe()
-	go func() {
-		defer pw.Close()
-		file, err := os.Open(filePath)
-		if err != nil {
-			return
-		}
-		defer file.Close()
-		// Encrypt on the fly?
-		// Wait, the /upload endpoint implementation EXPECTS an encrypted stream from the client?
-		// Yes: handleUpload calls decryptStream(destFile, r.Body).
-		// So we must encrypt it before sending to localhost /upload.
-		encryptStream(pw, file)
-	}()
-
-	req, err := http.NewRequest("POST", url, pr)
+	req, err := http.NewRequest("POST", url, file)
 	if err != nil {
 		log.Fatalf("❌ Failed to create request: %v", err)
 	}
+	req.Header.Set("Authorization", "Bearer "+appConfig.AdminCode)
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
-		log.Fatalf("❌ Upload failed (is K-Share running?): %v", err)
+		log.Fatalf("❌ Upload failed: %v", err)
 	}
 	defer resp.Body.Close()
 

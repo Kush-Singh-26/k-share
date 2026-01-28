@@ -71,7 +71,7 @@ import java.util.concurrent.TimeUnit
 class MainActivity : ComponentActivity() {
 
     private lateinit var settings: SettingsManager
-    private val client = OkHttpClient.Builder().connectTimeout(10, TimeUnit.SECONDS).build()
+    private lateinit var client: OkHttpClient
     private var webSocket: WebSocket? = null
     private var pollingJob: Job? = null
     
@@ -80,12 +80,23 @@ class MainActivity : ComponentActivity() {
     private var serverPortState = mutableStateOf("26260")
     private var statusColorState = mutableStateOf(Color.Yellow)
     private var clipboardTextState = mutableStateOf("")
+    private var clipboardChannelState = mutableStateOf("") // "" = private, "guest" = guest
+    private var isGuestModeState = mutableStateOf(false)
+    private var lastClipboardSync = ""
+    private var lastUserEditTime = 0L
     private var fileListState = mutableStateOf<List<RemoteFile>>(emptyList())
     private var isRefreshingState = mutableStateOf(false)
     private var showHistoryDialog = mutableStateOf(false)
     private var historyList = mutableStateOf<List<HistoryItem>>(emptyList())
     private var themeModeState = mutableStateOf("system")
     private var discoveryStatusState = mutableStateOf("")
+    
+    // Trust Dialog State
+    private var showTrustDialog = mutableStateOf(false)
+    private var pendingTrustIp = mutableStateOf("")
+    private var pendingTrustHash = mutableStateOf("")
+    private var pendingTrustPort = 26260
+
 
     private val folderPickerLauncher = registerForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
         uri?.let { 
@@ -96,12 +107,14 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private var lastClipboardSync = ""
-    private var lastUserEditTime = 0L
-
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         settings = SettingsManager(this)
+        ApiClient.init(this) // Initialize API Client with Context
+        client = OkHttpClient.Builder()
+            .connectTimeout(10, TimeUnit.SECONDS)
+            .sslSocketFactory(ApiClient.getSslSocketFactory(), ApiClient.getTrustManager())
+            .build()
         ThumbnailCache.init(this)
 
         serverIpState.value = settings.serverIp
@@ -126,10 +139,42 @@ class MainActivity : ComponentActivity() {
                             lifecycleScope.launch {
                                 val ip = serverIpState.value
                                 val port = serverPortState.value.toIntOrNull() ?: 26260
-                                if (ApiClient.deleteHistory(ip, port, item.id)) {
+                                if (ApiClient.deleteHistory(ip, port, item.id, settings.pairingCode)) {
                                     historyList.value = historyList.value.filter { it.id != item.id }
                                 }
                             }
+                        }
+                    )
+                }
+                
+                if (showTrustDialog.value) {
+                    AlertDialog(
+                        onDismissRequest = { 
+                            showTrustDialog.value = false 
+                            discoveryStatusState.value = "Connection cancelled"
+                        },
+                        title = { Text("New Server Found") },
+                        text = { 
+                            Column {
+                                Text("Do you trust this server?")
+                                Spacer(Modifier.height(8.dp))
+                                Text("IP: ${pendingTrustIp.value}", fontWeight = FontWeight.Bold)
+                                Text("Hash: ${pendingTrustHash.value.take(16)}...", fontSize = 12.sp, color = Color.Gray)
+                            }
+                        },
+                        confirmButton = {
+                            Button(onClick = {
+                                // Save as known server
+                                settings.saveServer(pendingTrustHash.value, pendingTrustIp.value, pendingTrustPort, settings.pairingCode)
+                                showTrustDialog.value = false
+                                connectToPendingServer()
+                            }) { Text("Trust & Connect") }
+                        },
+                        dismissButton = {
+                            TextButton(onClick = { 
+                                showTrustDialog.value = false
+                                discoveryStatusState.value = "Connection cancelled"
+                            }) { Text("Cancel") }
                         }
                     )
                 }
@@ -258,6 +303,45 @@ class MainActivity : ComponentActivity() {
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         Text("SHARED CLIPBOARD", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant, letterSpacing = 1.sp)
+                        // Channel Toggle (Only visible if NOT guest mode)
+                        if (!isGuestModeState.value) {
+                            Row(
+                                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                modifier = Modifier.padding(end = 8.dp)
+                            ) {
+                                 val isGuest = clipboardChannelState.value == "guest"
+                                 Text(
+                                     "Private", 
+                                     fontSize = 12.sp, 
+                                     fontWeight = if(!isGuest) FontWeight.Bold else FontWeight.Normal,
+                                     color = if(!isGuest) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
+                                     modifier = Modifier.clickable { 
+                                         clipboardChannelState.value = "" 
+                                         fetchClipboard()
+                                     }
+                                 )
+                                 Text("|", fontSize = 12.sp, color = MaterialTheme.colorScheme.outline)
+                                 Text(
+                                     "Guest", 
+                                     fontSize = 12.sp, 
+                                     fontWeight = if(isGuest) FontWeight.Bold else FontWeight.Normal,
+                                     color = if(isGuest) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
+                                     modifier = Modifier.clickable { 
+                                         clipboardChannelState.value = "guest" 
+                                         fetchClipboard()
+                                     }
+                                 )
+                            }
+                        } else {
+                            Text("Guest Mode", fontSize = 12.sp, color = MaterialTheme.colorScheme.tertiary)
+                        }
+                    }
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth().padding(top=4.dp),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
                         Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
                             TextButton(onClick = { pushClipboard() }, modifier = Modifier.height(30.dp), contentPadding = PaddingValues(horizontal = 8.dp)) { Text("Push", fontSize = 12.sp) }
                             TextButton(onClick = { fetchClipboard() }, modifier = Modifier.height(30.dp), contentPadding = PaddingValues(horizontal = 8.dp)) { Text("Fetch", fontSize = 12.sp) }
@@ -348,12 +432,12 @@ class MainActivity : ComponentActivity() {
         
         LaunchedEffect(file.name) {
             if (!file.isDir && file.name.lowercase().let { it.endsWith(".jpg") || it.endsWith(".png") }) {
-                val url = ApiClient.getThumbnailUrl(serverIpState.value, serverPortState.value.toIntOrNull()?:0, "tophone", file.name)
+                val url = ApiClient.getThumbnailUrl(serverIpState.value, serverPortState.value.toIntOrNull()?:0, file.name)
                 val key = "${serverIpState.value}_${file.name}"
                 val cached = ThumbnailCache.getFromMemory(key)
                 if (cached != null) thumbnail = cached
                 else withContext(Dispatchers.IO) {
-                    thumbnail = ThumbnailCache.get(key, url)
+                    thumbnail = ThumbnailCache.get(key, url, settings.pairingCode)
                 }
             }
         }
@@ -387,7 +471,25 @@ class MainActivity : ComponentActivity() {
                 )
             }
             Column(modifier = Modifier.padding(start = 12.dp).weight(1f)) {
-                Text(file.name, fontWeight = FontWeight.Bold, maxLines = 1, color = MaterialTheme.colorScheme.onSurface)
+                // Parse Name for Guest Label
+                var displayName = file.name
+                val isGuest = displayName.startsWith("Public/")
+                if (isGuest) displayName = displayName.removePrefix("Public/")
+                
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(displayName, fontWeight = FontWeight.Bold, maxLines = 1, color = MaterialTheme.colorScheme.onSurface, modifier = Modifier.weight(1f, false))
+                    if (isGuest) {
+                        Spacer(Modifier.width(8.dp))
+                        Text(
+                            "Guest", 
+                            fontSize = 10.sp, 
+                            color = MaterialTheme.colorScheme.tertiary,
+                            modifier = Modifier
+                                .border(1.dp, MaterialTheme.colorScheme.tertiary, RoundedCornerShape(4.dp))
+                                .padding(horizontal = 4.dp, vertical = 1.dp)
+                        )
+                    }
+                }
                 Text(if (file.isDir) "Folder • ${file.modTime}" else "${file.size / 1024} KB • ${file.modTime}", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
         }
@@ -458,7 +560,7 @@ class MainActivity : ComponentActivity() {
         closeWebSocket()
         val ip = serverIpState.value; val port = serverPortState.value
         if (ip.isEmpty()) return
-        val request = Request.Builder().url("ws://$ip:$port/ws").build()
+        val request = Request.Builder().url("wss://$ip:$port/ws").build()
         webSocket = client.newWebSocket(request, object : WebSocketListener() {
             override fun onOpen(webSocket: WebSocket, response: Response) {
                 statusColorState.value = Color(0xFF4CAF50)
@@ -467,7 +569,12 @@ class MainActivity : ComponentActivity() {
                 val type = JSONObject(text).optString("type")
                 lifecycleScope.launch(Dispatchers.Main) {
                     when (type) {
-                        "clip" -> fetchClipboard()
+                        "clip" -> {
+                            // Only fetch if user hasn't edited locally in the last 5 seconds
+                            if (System.currentTimeMillis() - lastUserEditTime > 5000) {
+                                fetchClipboard()
+                            }
+                        }
                         "files" -> refreshFileList()
                     }
                 }
@@ -488,10 +595,10 @@ class MainActivity : ComponentActivity() {
         stopPolling()
         pollingJob = lifecycleScope.launch {
             while (isActive) {
-                if (isOnWifi()) {
+                if (NetworkScanner.hasValidLan(this@MainActivity)) {
                     val ip = serverIpState.value; val port = serverPortState.value.toIntOrNull() ?: 26260
                     if (ip.isNotEmpty()) {
-                        val online = ApiClient.ping(ip, port, settings.pairingCode)
+                        val online = ApiClient.ping(ip, port).success
                         statusColorState.value = if (online) Color(0xFF4CAF50) else Color(0xFFF44336)
                         
                         if (!online && ApiClient.lastError != null) {
@@ -507,12 +614,6 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun stopPolling() { pollingJob?.cancel(); pollingJob = null }
-    
-    private fun isOnWifi(): Boolean {
-        val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
-        val caps = cm.getNetworkCapabilities(cm.activeNetwork) ?: return false
-        return caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)
-    }
 
     private fun scheduleBackgroundSync() {
         val constraints = Constraints.Builder().setRequiredNetworkType(NetworkType.UNMETERED).build()
@@ -522,7 +623,6 @@ class MainActivity : ComponentActivity() {
 
     private fun tryAutoConnect() {
         lifecycleScope.launch {
-            // Connectivity Gatekeeper
             if (!NetworkScanner.hasValidLan(this@MainActivity)) {
                 statusColorState.value = Color.Gray
                 discoveryStatusState.value = "No LAN"
@@ -536,34 +636,19 @@ class MainActivity : ComponentActivity() {
                 val cachedIp = settings.getLastServerIp(networkId)
                 if (cachedIp != null) {
                     discoveryStatusState.value = "Connecting..."
-                    val success = NetworkScanner.quickPing(cachedIp, port, settings.pairingCode)
-                    if (success) {
-                        serverIpState.value = cachedIp
-                        settings.serverIp = cachedIp
-                        statusColorState.value = Color(0xFF4CAF50)
-                        discoveryStatusState.value = ""
-                        connectWebSocket()
-                        startPolling()
-                        refreshFileList()
-                        return@launch
-                    } else {
-                        statusColorState.value = Color(0xFFF44336)
-                        discoveryStatusState.value = "Server offline"
-                    }
+                    verifyAndConnect(cachedIp, port, true) // silent mode
+                    return@launch
                 }
             }
             
-            // If no cached IP or ping failed, just start polling with existing IP
             if (serverIpState.value.isNotEmpty()) {
-                connectWebSocket()
-                startPolling()
+                verifyAndConnect(serverIpState.value, port, true)
             }
         }
     }
 
     private fun discoverServer() {
         lifecycleScope.launch {
-            // Connectivity Gatekeeper
             if (!NetworkScanner.hasValidLan(this@MainActivity)) {
                 statusColorState.value = Color.Gray
                 discoveryStatusState.value = "No LAN"
@@ -571,49 +656,36 @@ class MainActivity : ComponentActivity() {
             }
             
             val port = serverPortState.value.toIntOrNull() ?: 26260
-            
-            // Check cached IP first
+            statusColorState.value = Color.Yellow
+
+            // Check cached
             val networkId = NetworkScanner.getNetworkId(this@MainActivity)
             if (networkId != null) {
                 val cachedIp = settings.getLastServerIp(networkId)
-                if (cachedIp != null) {
-                    discoveryStatusState.value = "Checking saved: $cachedIp"
-                    statusColorState.value = Color.Yellow
-                    val success = NetworkScanner.quickPing(cachedIp, port, settings.pairingCode)
-                    if (success) {
-                        serverIpState.value = cachedIp
-                        settings.serverIp = cachedIp
-                        statusColorState.value = Color(0xFF4CAF50)
-                        discoveryStatusState.value = ""
-                        refreshFileList()
-                        connectWebSocket()
-                        return@launch
-                    }
+                if (cachedIp != null && verifyAndConnect(cachedIp, port, true)) {
+                    return@launch
                 }
             }
             
-            // Network scan
-            statusColorState.value = Color.Yellow
-            val foundIp = NetworkScanner.findServer(
-                context = this@MainActivity,
-                port = port,
-                pairingCode = settings.pairingCode
-            ) { status ->
-                runOnUiThread { discoveryStatusState.value = status }
+            // Scan
+            var foundIp: String? = null
+            try {
+                foundIp = NetworkScanner.findServer(
+                    context = this@MainActivity,
+                    port = port,
+                    pairingCode = settings.pairingCode // unused in scanning now
+                ) { status ->
+                    runOnUiThread { discoveryStatusState.value = status }
+                }
+            } catch (e: Exception) {
+                statusColorState.value = Color(0xFFF44336)
+                discoveryStatusState.value = "Discovery Error: ${e.message}"
+                return@launch
             }
             
             if (foundIp != null) {
-                serverIpState.value = foundIp
-                settings.serverIp = foundIp
-                statusColorState.value = Color(0xFF4CAF50)
-                discoveryStatusState.value = ""
-                
-                // Cache the IP for this network
-                NetworkScanner.getNetworkId(this@MainActivity)?.let {
-                    settings.setLastServerIp(it, foundIp)
-                }
-                refreshFileList()
-                connectWebSocket()
+                discoveryStatusState.value = "Found: $foundIp"
+                verifyAndConnect(foundIp, port, false)
             } else {
                 statusColorState.value = Color(0xFFF44336)
                 discoveryStatusState.value = "Server not found"
@@ -624,33 +696,98 @@ class MainActivity : ComponentActivity() {
     private fun verifyManualIp() {
         val ip = serverIpState.value.trim()
         if (ip.isEmpty()) return
-        
         val port = serverPortState.value.toIntOrNull() ?: 26260
         
         lifecycleScope.launch {
             statusColorState.value = Color.Yellow
-            val success = NetworkScanner.verifyManualIp(
-                ip = ip,
-                port = port,
-                pairingCode = settings.pairingCode
-            ) { status ->
-                runOnUiThread { discoveryStatusState.value = status }
-            }
+            verifyAndConnect(ip, port, false)
+        }
+    }
+
+    // Returns true if connected or prompt shown, false if failed
+    private suspend fun verifyAndConnect(ip: String, port: Int, silent: Boolean): Boolean {
+        // Pass pairing code to check role
+        val result = ApiClient.ping(ip, port, settings.pairingCode)
+        if (result.success && result.certHash != null) {
             
-            if (success) {
-                settings.serverIp = ip
-                statusColorState.value = Color(0xFF4CAF50)
-                discoveryStatusState.value = ""
+            // Apply Role Settings
+            runOnUiThread {
+                if (result.role == "guest") {
+                    isGuestModeState.value = true
+                    clipboardChannelState.value = "guest"
+                } else {
+                     isGuestModeState.value = false
+                     // Keep existing channel selection or default to private
+                }
+            }
+
+            val known = settings.getKnownServers()[result.certHash]
+            if (known != null) {
+                // Trusted Server
+                // Update IP if changed (roaming)
+                if (known.ip != ip) {
+                    settings.saveServer(result.certHash, ip, port, known.authCode)
+                }
+                
+                runOnUiThread {
+                    serverIpState.value = ip
+                    settings.serverIp = ip
+                    statusColorState.value = Color(0xFF4CAF50)
+                    discoveryStatusState.value = ""
+                    connectWebSocket()
+                    refreshFileList()
+                    startPolling()
+                }
                 
                 // Cache for auto-connect
                 NetworkScanner.getNetworkId(this@MainActivity)?.let {
                     settings.setLastServerIp(it, ip)
                 }
-                refreshFileList()
-                connectWebSocket()
+                return true
             } else {
-                statusColorState.value = Color(0xFFF44336)
+                // New Server -> Prompt Trust
+                if (!silent) {
+                    runOnUiThread {
+                        pendingTrustIp.value = ip
+                        pendingTrustHash.value = result.certHash
+                        pendingTrustPort = port
+                        showTrustDialog.value = true
+                    }
+                    return true
+                }
             }
+        } else {
+             if (!silent) {
+                 statusColorState.value = Color(0xFFF44336)
+                 discoveryStatusState.value = "Connection failed"
+             }
+        }
+        return false
+    }
+
+    private fun connectToPendingServer() {
+        val ip = pendingTrustIp.value
+        val port = pendingTrustPort
+        
+        // After trusting, we just connect. 
+        // Note: The code in settings.pairingCode might be wrong for this server if it uses a different code.
+        // But for now we assume global pairing code or the user will update it in Settings.
+        // Ideally TrustDialog should ask for Code too?
+        // Plan says: "If Yes: Prompt for Code (or try existing code?)".
+        // Let's stick to existing code for simplicity or open Settings?
+        // Current implementation: uses global settings.pairingCode.
+        
+        serverIpState.value = ip
+        settings.serverIp = ip
+        statusColorState.value = Color(0xFF4CAF50)
+        discoveryStatusState.value = ""
+        connectWebSocket()
+        refreshFileList()
+        startPolling()
+        
+        // Cache
+        NetworkScanner.getNetworkId(this@MainActivity)?.let {
+            settings.setLastServerIp(it, ip)
         }
     }
 
@@ -658,7 +795,7 @@ class MainActivity : ComponentActivity() {
         val ip = serverIpState.value; val port = serverPortState.value.toIntOrNull() ?: 26260
         if (ip.isEmpty()) return
         lifecycleScope.launch {
-            val text = ApiClient.getClipboard(ip, port, settings.pairingCode)
+            val text = ApiClient.getClipboard(ip, port, settings.pairingCode, clipboardChannelState.value)
             if (text != null) {
                 if (clipboardTextState.value != text) clipboardTextState.value = text
                 lastClipboardSync = text
@@ -668,7 +805,7 @@ class MainActivity : ComponentActivity() {
 
     private fun fetchClipboardSilently(ip: String, port: Int) {
         lifecycleScope.launch {
-            val text = ApiClient.getClipboard(ip, port, settings.pairingCode)
+            val text = ApiClient.getClipboard(ip, port, settings.pairingCode, clipboardChannelState.value)
             if (text != null && text != lastClipboardSync) {
                 clipboardTextState.value = text
                 lastClipboardSync = text
@@ -681,7 +818,7 @@ class MainActivity : ComponentActivity() {
         if (ip.isEmpty()) return
         val text = clipboardTextState.value
         lifecycleScope.launch {
-            if (ApiClient.postClipboard(ip, port, text, settings.pairingCode)) {
+            if (ApiClient.postClipboard(ip, port, text, settings.pairingCode, false, clipboardChannelState.value)) {
                 lastClipboardSync = text
                 Toast.makeText(this@MainActivity, "Pushed", Toast.LENGTH_SHORT).show()
             }
