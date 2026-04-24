@@ -4,13 +4,13 @@ plugins {
 }
 
 android {
-    namespace = "com.kush.kshare"
-    compileSdk = 34
+    namespace = "com.kshare.android"
+    compileSdk = 35
 
     defaultConfig {
-        applicationId = "com.kush.kshare"
+        applicationId = "com.kshare.android"
         minSdk = 24
-        targetSdk = 34
+        targetSdk = 35
         versionCode = 1
         versionName = "1.0"
 
@@ -61,4 +61,6 @@ dependencies {
 
     // WorkManager (background discovery)
     implementation("androidx.work:work-runtime-ktx:2.9.0")
+
+    testImplementation(libs.junit)
 }

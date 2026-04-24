@@ -1,0 +1,496 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>K-Share Admin Dashboard</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --bg-primary: #0a0a0a;
+            --bg-secondary: #141414;
+            --bg-surface: #1e1e1e;
+            --text-primary: #f5f5f5;
+            --text-secondary: #a0a0a0;
+            --text-muted: #666666;
+            --accent: #2ecc71;
+            --accent-hover: #27ae60;
+            --danger: #e74c3c;
+            --border: #2a2a2a;
+            --sidebar-width: 240px;
+        }
+
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+
+        body {
+            font-family: 'Inter', system-ui, sans-serif;
+            background-color: var(--bg-primary);
+            color: var(--text-primary);
+            height: 100vh;
+            display: flex;
+            overflow: hidden;
+        }
+
+        /* Login Page */
+        #login-screen {
+            position: fixed;
+            inset: 0;
+            background: var(--bg-primary);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            z-index: 1000;
+        }
+
+        .login-card {
+            background: var(--bg-secondary);
+            border: 1px solid var(--border);
+            padding: 2.5rem;
+            width: 100%;
+            max-width: 400px;
+            border-radius: 4px;
+        }
+
+        .login-card h1 {
+            font-size: 1.5rem;
+            font-weight: 600;
+            margin-bottom: 0.5rem;
+        }
+
+        .login-card p {
+            color: var(--text-secondary);
+            font-size: 0.875rem;
+            margin-bottom: 2rem;
+        }
+
+        input {
+            width: 100%;
+            background: var(--bg-surface);
+            border: 1px solid var(--border);
+            color: var(--text-primary);
+            padding: 0.75rem 1rem;
+            border-radius: 4px;
+            font-size: 1rem;
+            margin-bottom: 1.5rem;
+            transition: border-color 0.2s;
+        }
+
+        input:focus {
+            outline: none;
+            border-color: var(--accent);
+        }
+
+        button {
+            width: 100%;
+            background: var(--accent);
+            color: #000;
+            border: none;
+            padding: 0.75rem;
+            font-weight: 600;
+            border-radius: 4px;
+            cursor: pointer;
+            transition: opacity 0.2s;
+        }
+
+        button:hover {
+            opacity: 0.9;
+        }
+
+        /* Sidebar */
+        nav {
+            width: var(--sidebar-width);
+            background: var(--bg-secondary);
+            border-right: 1px solid var(--border);
+            padding: 2rem 1.5rem;
+            display: flex;
+            flex-direction: column;
+        }
+
+        .nav-header {
+            font-size: 1.25rem;
+            font-weight: 700;
+            margin-bottom: 3rem;
+            display: flex;
+            align-items: center;
+            gap: 0.75rem;
+        }
+
+        .nav-item {
+            color: var(--text-secondary);
+            text-decoration: none;
+            padding: 0.75rem 0;
+            font-weight: 500;
+            transition: color 0.2s;
+            cursor: pointer;
+        }
+
+        .nav-item:hover, .nav-item.active {
+            color: var(--text-primary);
+        }
+
+        /* Main Content */
+        main {
+            flex: 1;
+            padding: 3rem;
+            overflow-y: auto;
+        }
+
+        .section-title {
+            font-size: 1.875rem;
+            font-weight: 600;
+            margin-bottom: 2rem;
+        }
+
+        /* Cards */
+        .grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            gap: 1.5rem;
+        }
+
+        .card {
+            background: var(--bg-secondary);
+            border: 1px solid var(--border);
+            padding: 1.5rem;
+            border-radius: 4px;
+        }
+
+        .card-title {
+            font-size: 0.75rem;
+            font-weight: 600;
+            color: var(--text-muted);
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            margin-bottom: 1rem;
+        }
+
+        .card-value {
+            font-size: 1.25rem;
+            font-weight: 500;
+            font-family: 'JetBrains Mono', monospace;
+        }
+
+        /* UI Components */
+        .button-secondary {
+            background: var(--bg-surface);
+            color: var(--text-primary);
+            border: 1px solid var(--border);
+        }
+
+        .code-box {
+            background: var(--bg-surface);
+            padding: 1rem;
+            font-family: 'JetBrains Mono', monospace;
+            border: 1px solid var(--border);
+            border-radius: 4px;
+            margin: 1rem 0;
+            position: relative;
+        }
+
+        .log-panel {
+            background: #000;
+            color: #2ecc71;
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.8125rem;
+            padding: 1rem;
+            border-radius: 4px;
+            height: 400px;
+            overflow-y: auto;
+            border: 1px solid var(--border);
+            line-height: 1.5;
+        }
+
+        /* Hidden Utility */
+        .hidden { display: none !important; }
+
+        .status-badge {
+            display: inline-block;
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: var(--accent);
+            margin-right: 0.5rem;
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 1rem;
+        }
+
+        th {
+            text-align: left;
+            font-size: 0.75rem;
+            color: var(--text-muted);
+            padding: 1rem;
+            border-bottom: 1px solid var(--border);
+        }
+
+        td {
+            padding: 1rem;
+            border-bottom: 1px solid var(--border);
+            font-size: 0.875rem;
+        }
+    </style>
+</head>
+<body>
+    <!-- Login Section -->
+    <div id="login-screen">
+        <div class="login-card">
+            <h1>Admin Console</h1>
+            <p>Access requires administrative authorization.</p>
+            <input type="password" id="admin-code-input" placeholder="Admin Code" autofocus>
+            <button onclick="login()">Authenticate</button>
+        </div>
+    </div>
+
+    <!-- Application App Layout -->
+    <nav id="sidebar" class="hidden">
+        <div class="nav-header">
+            <span class="status-badge"></span> K-Share
+        </div>
+        <div class="nav-item active" onclick="showSection('overview')">Overview</div>
+        <div class="nav-item" onclick="showSection('config')">Configuration</div>
+        <div class="nav-item" onclick="showSection('files')">File Management</div>
+        <div class="nav-item" onclick="showSection('logs')">System Logs</div>
+        <div style="margin-top: auto">
+            <div class="nav-item" style="color: var(--danger)" onclick="logout()">Logout</div>
+        </div>
+    </nav>
+
+    <main id="content" class="hidden">
+        <!-- Overview Section -->
+        <div id="section-overview" class="view">
+            <h2 class="section-title">System Overview</h2>
+            <div class="grid">
+                <div class="card">
+                    <div class="card-title">Connections</div>
+                    <div class="card-value" id="stat-connections">0</div>
+                </div>
+                <div class="card">
+                    <div class="card-title">Network Endpoint</div>
+                    <div class="card-value" id="stat-endpoint">https://...</div>
+                </div>
+                <div class="card">
+                    <div class="card-title">Storage Path</div>
+                    <div class="card-value" id="stat-storage" style="font-size: 0.875rem">/path/to/files</div>
+                </div>
+            </div>
+            
+            <div style="margin-top: 2rem">
+                <div class="card">
+                    <div class="card-title">Security Codes</div>
+                    <div class="grid" style="grid-template-columns: 1fr 1fr">
+                        <div>
+                            <p style="font-size: 0.75rem; color: var(--text-muted)">ADMINISTRATOR</p>
+                            <div class="code-box" id="code-admin">••••••</div>
+                        </div>
+                        <div>
+                            <p style="font-size: 0.75rem; color: var(--text-muted)">GUEST</p>
+                            <div class="code-box" id="code-guest">••••••</div>
+                        </div>
+                    </div>
+                    <div style="display: flex; gap: 1rem">
+                        <button class="button-secondary" onclick="revealCodes()">Reveal</button>
+                        <button class="button-secondary" onclick="rotateCodes()">Rotate All</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Configuration Section -->
+        <div id="section-config" class="view hidden">
+            <h2 class="section-title">Configuration</h2>
+            <div class="card" style="max-width: 600px">
+                <p style="margin-bottom: 2rem; color: var(--text-secondary)">Modifications to core parameters may require a server restart.</p>
+                <div class="field">
+                    <p class="card-title">Listen Port</p>
+                    <input type="text" id="config-port">
+                </div>
+                <div class="field">
+                    <p class="card-title">Storage Directory</p>
+                    <input type="text" id="config-dir">
+                </div>
+                <button onclick="saveConfig()">Commit Changes</button>
+            </div>
+        </div>
+
+        <!-- Files Section -->
+        <div id="section-files" class="view hidden">
+            <h2 class="section-title">File Management</h2>
+            <div class="card">
+                <div style="display: flex; justify-content: space-between; align-items: center">
+                    <div class="card-title">Active Storage</div>
+                    <button class="button-secondary" style="width: auto; padding: 0.5rem 1rem" onclick="clearTrash()">Empty Trash</button>
+                </div>
+                <table id="files-table">
+                    <thead>
+                        <tr>
+                            <th>NAME</th>
+                            <th>SIZE</th>
+                            <th>LAST MODIFIED</th>
+                        </tr>
+                    </thead>
+                    <tbody id="files-body">
+                        <!-- Filled by JS -->
+                    </tbody>
+                </table>
+            </div>
+        </div>
+
+        <!-- Logs Section -->
+        <div id="section-logs" class="view hidden">
+            <h2 class="section-title">System Logs</h2>
+            <div class="log-panel" id="log-content">
+                Initializing logs...
+            </div>
+        </div>
+    </main>
+
+    <script>
+        let adminCode = sessionStorage.getItem('k-share-token');
+
+        function login() {
+            const input = document.getElementById('admin-code-input');
+            adminCode = input.value;
+            // Verify by attempting a status fetch
+            fetchData('/api/admin/status').then(data => {
+                if (data) {
+                    sessionStorage.setItem('k-share-token', adminCode);
+                    document.getElementById('login-screen').classList.add('hidden');
+                    document.getElementById('sidebar').classList.remove('hidden');
+                    document.getElementById('content').classList.remove('hidden');
+                    startPolling();
+                } else {
+                    alert('Invalid Administrator Code');
+                }
+            });
+        }
+
+        async function fetchData(url, options = {}) {
+            const defaultOptions = {
+                headers: {
+                    'Authorization': `Bearer ${adminCode}`
+                }
+            };
+            try {
+                const response = await fetch(url, { ...defaultOptions, ...options });
+                if (response.status === 401 || response.status === 403) {
+                    logout();
+                    return null;
+                }
+                return await response.json();
+            } catch (e) {
+                console.error(e);
+                return null;
+            }
+        }
+
+        function logout() {
+            sessionStorage.removeItem('k-share-token');
+            location.reload();
+        }
+
+        function showSection(id) {
+            document.querySelectorAll('.view').forEach(v => v.classList.add('hidden'));
+            document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
+            document.getElementById(`section-${id}`).classList.remove('hidden');
+            event.target.classList.add('active');
+            updateUI(id);
+        }
+
+        function startPolling() {
+            updateUI('overview');
+            setInterval(() => {
+                if (!document.getElementById('section-overview').classList.contains('hidden')) updateUI('overview');
+                if (!document.getElementById('section-logs').classList.contains('hidden')) updateUI('logs');
+            }, 5000);
+        }
+
+        async function updateUI(section) {
+            if (section === 'overview') {
+                const status = await fetchData('/api/admin/status');
+                if (status) {
+                    document.getElementById('stat-connections').innerText = status.clientCount;
+                    document.getElementById('stat-endpoint').innerText = `https://${location.hostname}:${status.port}`;
+                    document.getElementById('stat-storage').innerText = status.sharedDir;
+                }
+            }
+            if (section === 'config') {
+                const cfg = await fetchData('/api/admin/config');
+                if (cfg) {
+                    document.getElementById('config-port').value = cfg.port;
+                    document.getElementById('config-dir').value = cfg.shared_dir;
+                }
+            }
+            if (section === 'logs') {
+                const lines = await fetchData('/api/admin/logs');
+                if (lines) {
+                    document.getElementById('log-content').innerText = lines.join('\n');
+                    const el = document.getElementById('log-content');
+                    el.scrollTop = el.scrollHeight;
+                }
+            }
+            if (section === 'files') {
+                const files = await fetchData('/api/admin/files');
+                if (files) {
+                    const body = document.getElementById('files-body');
+                    body.innerHTML = files.map(f => `
+                        <tr>
+                            <td>${f.name}${f.dir ? '/' : ''}</td>
+                            <td>${f.dir ? '-' : formatSize(f.size)}</td>
+                            <td>${new Date(f.mtime).toLocaleString()}</td>
+                        </tr>
+                    `).join('');
+                }
+            }
+        }
+
+        async function revealCodes() {
+            const cfg = await fetchData('/api/admin/config');
+            if (cfg) {
+                document.getElementById('code-admin').innerText = cfg.admin_code;
+                document.getElementById('code-guest').innerText = cfg.guest_code;
+            }
+        }
+
+        async function rotateCodes() {
+            if (confirm('Regenerate all access codes? Existing sessions will be terminated.')) {
+                await fetchData('/api/admin/rotate-codes');
+                revealCodes();
+            }
+        }
+
+        async function saveConfig() {
+            const payload = {
+                port: document.getElementById('config-port').value,
+                shared_dir: document.getElementById('config-dir').value
+            };
+            const res = await fetchData('/api/admin/config', {
+                method: 'POST',
+                body: JSON.stringify(payload)
+            });
+            if (res) alert('Config saved. Restart server to apply changes.');
+        }
+
+        function formatSize(bytes) {
+            if (bytes === 0) return '0 B';
+            const k = 1024;
+            const sizes = ['B', 'KB', 'MB', 'GB'];
+            const i = Math.floor(Math.log(bytes) / Math.log(k));
+            return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+        }
+
+        // Auto-login if token exists
+        if (adminCode) {
+            login();
+        }
+    </script>
+</body>
+</html>

@@ -1,0 +1,28 @@
+# desktop-app/session
+session\session.go:63:16: cannot use m.apiConcrete (variable of type *api.Client) as APIClient value in assignment: *api.Client does not implement APIClient (wrong type for method Ping)
+		have Ping(context.Context) (string, error)
+		want Ping() (string, error)
+# desktop-app/thumbnails
+thumbnails\service.go:179:37: not enough arguments in call to s.client.GetThumbnail
+	have (string)
+	want (context.Context, string)
+# desktop-app/fileops [desktop-app/fileops.test]
+fileops\service_test.go:13:25: undefined: DownloadPathForTest
+fileops\service_test.go:30:25: undefined: DownloadPathForTest
+FAIL	desktop-app [build failed]
+?   	desktop-app/api	[no test files]
+ok  	desktop-app/clipboardops	(cached)
+ok  	desktop-app/config	(cached)
+?   	desktop-app/crypto	[no test files]
+?   	desktop-app/discovery	[no test files]
+ok  	desktop-app/discoveryops	(cached)
+FAIL	desktop-app/fileops [build failed]
+?   	desktop-app/historyops	[no test files]
+?   	desktop-app/platform	[no test files]
+ok  	desktop-app/presentation	(cached)
+FAIL	desktop-app/session [build failed]
+FAIL	desktop-app/thumbnails [build failed]
+?   	desktop-app/trustops	[no test files]
+FAIL	desktop-app/tui [build failed]
+FAIL	desktop-app/ui [build failed]
+FAIL

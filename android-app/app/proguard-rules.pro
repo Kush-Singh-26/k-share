@@ -21,7 +21,11 @@
 #-renamesourcefileattribute SourceFile
 
 # Keep API data classes for Gson serialization
--keep class com.kush.kshare.api.** { *; }
+-keep class com.kshare.android.api.** { *; }
+-keepclassmembers class com.kshare.android.api.** { *; }
+-keep class com.kshare.android.data.** { *; }
+-keepclassmembers class com.kshare.android.data.** { *; }
+-keep class com.google.gson.** { *; }
 # Keep the internal database implementation used by WorkManager
 -keep class androidx.work.impl.WorkDatabase_Impl { *; }
 

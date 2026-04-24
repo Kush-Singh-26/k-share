@@ -13,29 +13,34 @@ android-app/app/google-services.json
 android-app/app/release/
 
 # Go Server
-windows-server/*.exe
-windows-server/*.exe~
-windows-server/*.dll
-windows-server/*.so
-windows-server/*.dylib
-windows-server/*.test
-windows-server/*.out
-windows-server/config.json
-windows-server/clipboard.txt
-windows-server/guest_clipboard.txt
-windows-server/clipboard_history.json
-windows-server/server_log.txt
-windows-server/cert.pem
-windows-server/key.pem
-windows-server/.thumbnails/
-windows-server/from_phone/
-windows-server/to_phone/
+server/*.exe
+server/*.exe~
+server/*.dll
+server/*.so
+server/*.dylib
+server/*.test
+server/*.out
+server/config.json
+server/clipboard.txt
+server/guest_clipboard.txt
+server/clipboard_history.json
+server/server_log.txt
+server/cert.pem
+server/key.pem
+server/.thumbnails/
+server/from_phone/
+server/to_phone/
 *.syso
 .env
 
-# Windows Client
-windows-client/*.exe
-windows-client/current_theme.txt
+# Desktop App
+desktop-app/*.exe
+desktop-app/current_theme.txt
+
+# Android local state
+android-app/local.properties
+android-app/release-key
+android-app/hs_err_pid*.log
 
 # IDEs
 .idea/
@@ -48,3 +53,5 @@ windows-client/current_theme.txt
 # Misc
 *.log
 tmp/
+
+*.exe
