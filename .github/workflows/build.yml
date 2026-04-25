@@ -130,7 +130,7 @@ jobs:
         working-directory: desktop-app
         run: |
           go install fyne.io/tools/cmd/fyne@latest
-          fyne package --os ${{ matrix.target }} --icon ../assets/Icon.png --name k-share-desktop --release --appID com.kshare.desktop
+          fyne package --os ${{ matrix.target }} --icon ../assets/Icon.png --name k-share-desktop --release --app-id com.kshare.desktop
 
       - name: Rename artifact
         if: matrix.target == 'darwin'
