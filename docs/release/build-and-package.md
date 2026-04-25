@@ -1,6 +1,6 @@
 # Build and Package
 
-> **Version**: 1.0
+> **Version**: 6.0
 > **Last Updated**: 2026-04-25
 
 ## Automated Builds via GitHub Actions

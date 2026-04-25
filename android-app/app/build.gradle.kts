@@ -12,13 +12,22 @@ android {
         minSdk = 24
         targetSdk = 35
         versionCode = 1
-        versionName = "1.0"
+        versionName = "6.0.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
     buildTypes {
+        signingConfigs {
+            create("externalOverride") {
+                storeFile = file("../release-key.jks")
+                storePassword = "kush26k-share"
+                keyAlias = "kshare-release"
+                keyPassword = "kush26k-share"
+            }
+        }
         release {
+            signingConfig = signingConfigs.getByName("externalOverride")
             isMinifyEnabled = true
             isShrinkResources = true
             proguardFiles(
@@ -27,6 +36,7 @@ android {
             )
         }
     }
+
     buildFeatures {
         compose = true
     }

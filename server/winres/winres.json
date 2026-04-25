@@ -10,8 +10,8 @@
     "#1": {
       "0409": {
         "identity": {
-          "name": "",
-          "version": ""
+          "name": "K-Share Server",
+          "version": "6.0.0.0"
         },
         "description": "",
         "minimum-os": "win7",
@@ -35,22 +35,22 @@
     "#1": {
       "0000": {
         "fixed": {
-          "file_version": "0.0.0.0",
-          "product_version": "0.0.0.0"
+          "file_version": "6.0.0.0",
+          "product_version": "6.0.0.0"
         },
         "info": {
           "0409": {
             "Comments": "",
-            "CompanyName": "",
-            "FileDescription": "",
-            "FileVersion": "",
-            "InternalName": "",
-            "LegalCopyright": "",
+            "CompanyName": "K-Share",
+            "FileDescription": "K-Share Encrypted Local Media Sharing Server",
+            "FileVersion": "6.0.0.0",
+            "InternalName": "k-share-server",
+            "LegalCopyright": "Copyright 2026 K-Share",
             "LegalTrademarks": "",
-            "OriginalFilename": "",
+            "OriginalFilename": "k-share-server.exe",
             "PrivateBuild": "",
-            "ProductName": "",
-            "ProductVersion": "",
+            "ProductName": "K-Share Server",
+            "ProductVersion": "6.0.0.0",
             "SpecialBuild": ""
           }
         }

@@ -1,6 +1,6 @@
 # Config Schema
 
-> **Version**: 1.0
+> **Version**: 6.0
 > **Last Updated**: 2026-04-25
 
 This document captures the current config and settings shapes used by the three products.

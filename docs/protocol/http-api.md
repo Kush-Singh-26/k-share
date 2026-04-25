@@ -1,6 +1,6 @@
 # HTTP API
 
-> **Version**: 1.2
+> **Version**: 6.0
 > **Last Updated**: 2026-04-25
 
 This document describes the current server HTTP contract.
@@ -34,7 +34,7 @@ Response:
 {
   "status": "ok",
   "name": "K-Share Server",
-  "proto": "v1.2",
+  "proto": "v6.0",
   "role": "admin"
 }
 ```

@@ -7,18 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Added
+## [6.0.0] - 2026-04-25
 
-- GitHub Actions workflow for automated cross-platform builds and releases
-- CI/CD documentation for automated builds
-- CONTRIBUTING.md for developer guidelines
-- SECURITY.md for vulnerability reporting
-- Build badges and automated build documentation
+### Added
+- **Smart Network Discovery**: Tiered TCP-based discovery system with priority zone scanning.
+- **Enhanced Security**: 
+    - Full TLS 1.3 / HTTPS encryption for all traffic.
+    - Trust-On-First-Use (TOFU) certificate pinning.
+    - Dual-Role System (Admin & Guest) with strict server-side enforcement.
+- **Advanced File Transfer**:
+    - Folder support with on-the-fly zipping/unzipping.
+    - Recursive uploads from Android.
+    - Automatic versioning to prevent file overwrites.
+- **Modernized UI**:
+    - High-performance dashboard in Fyne (Desktop).
+    - Jetpack Compose-based Android App.
+    - System tray integration with IP display.
 
 ### Changed
-
-- Repository organization now uses cross-platform naming (server, desktop-app, android-app)
-- Desktop app uses consistent naming across platforms
+- Migrated from mDNS-only discovery to reliable TCP zone scanning.
+- Improved background architecture for "set-and-forget" reliability.
 
 ## [1.0.0] - Initial Release
 

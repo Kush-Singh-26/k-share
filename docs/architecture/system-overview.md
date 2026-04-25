@@ -1,6 +1,6 @@
 # System Overview
 
-> **Version**: 1.0
+> **Version**: 6.0
 > **Last Updated**: 2026-04-25
 
 K-Share is a local-network sharing system with three products:
