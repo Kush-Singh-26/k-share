@@ -17,10 +17,13 @@ jobs:
         include:
           - os: linux
             runner: ubuntu-latest
+            arch: amd64
           - os: windows
             runner: windows-latest
+            arch: amd64
           - os: darwin
-            runner: macos-13
+            runner: macos-latest
+            arch: arm64
     steps:
       - uses: actions/checkout@v4
 
@@ -43,7 +46,13 @@ jobs:
           if [ "${{ matrix.os }}" = "windows" ]; then
             EXT=".exe"
           fi
-          CGO_ENABLED=1 GOOS=${{ matrix.os }} GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o ../k-share-server-${{ matrix.os }}-amd64${EXT}
+          CGO_ENABLED=1 GOOS=${{ matrix.os }} GOARCH=${{ matrix.arch }} go build -trimpath -ldflags="-s -w" -o ../k-share-server-${{ matrix.os }}-${{ matrix.arch }}${EXT}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: server-${{ matrix.os }}-${{ matrix.arch }}
+          path: k-share-server-${{ matrix.os }}-${{ matrix.arch }}*
 
   build-tui:
     runs-on: ${{ matrix.runner }}
@@ -53,10 +62,13 @@ jobs:
         include:
           - os: linux
             runner: ubuntu-latest
+            arch: amd64
           - os: windows
             runner: windows-latest
+            arch: amd64
           - os: darwin
-            runner: macos-13
+            runner: macos-latest
+            arch: arm64
     steps:
       - uses: actions/checkout@v4
 
@@ -79,13 +91,13 @@ jobs:
           if [ "${{ matrix.os }}" = "windows" ]; then
             EXT=".exe"
           fi
-          CGO_ENABLED=1 GOOS=${{ matrix.os }} GOARCH=amd64 go build -tags tui -trimpath -ldflags="-s -w" -o ../k-share-tui-${{ matrix.os }}-amd64${EXT} main_tui.go
+          CGO_ENABLED=1 GOOS=${{ matrix.os }} GOARCH=${{ matrix.arch }} go build -tags tui -trimpath -ldflags="-s -w" -o ../k-share-tui-${{ matrix.os }}-${{ matrix.arch }}${EXT} main_tui.go
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: tui-${{ matrix.os }}-amd64
-          path: k-share-tui-${{ matrix.os }}-amd64*
+          name: tui-${{ matrix.os }}-${{ matrix.arch }}
+          path: k-share-tui-${{ matrix.os }}-${{ matrix.arch }}*
 
   build-gui:
     needs: build-server
@@ -123,7 +135,11 @@ jobs:
 
       - name: Rename artifact
         if: matrix.target == 'darwin'
-        run: mv k-share-desktop.app k-share-desktop-macos-amd64.app
+        run: mv k-share-desktop.app k-share-desktop-macos-arm64.app
+
+      - name: Zip macOS app
+        if: matrix.target == 'darwin'
+        run: zip -r k-share-desktop-macos-arm64.zip k-share-desktop-macos-arm64.app
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -132,13 +148,14 @@ jobs:
           path: |
             k-share-desktop-*
             !*.app
+            !*.zip
 
       - name: Upload macOS app
         if: matrix.target == 'darwin'
         uses: actions/upload-artifact@v4
         with:
           name: gui-darwin-app
-          path: k-share-desktop-macos-amd64.app
+          path: k-share-desktop-macos-arm64.zip
 
   release:
     needs: [build-server, build-tui, build-gui]
@@ -157,8 +174,9 @@ jobs:
         with:
           files: |
             artifacts/**/*.exe
-            artifacts/build-gui/k-share-desktop-*
-            artifacts/*/k-share-tui-*
-            artifacts/*/k-share-server-*
+            artifacts/**/*.tar.gz
+            artifacts/**/*.zip
+            artifacts/tui-*/k-share-tui-*
+            artifacts/server-*/k-share-server-*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
