@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/canvas"
@@ -177,7 +178,9 @@ func (s *Service) loadSync(filename string, imgWidget *canvas.Image) {
 		}
 	}
 
-	data, err := s.client.GetThumbnail(context.TODO(), filename)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	data, err := s.client.GetThumbnail(ctx, filename)
 	if err != nil {
 		return
 	}

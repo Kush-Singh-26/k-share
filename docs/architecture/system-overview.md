@@ -1,5 +1,8 @@
 # System Overview
 
+> **Version**: 1.0
+> **Last Updated**: 2026-04-25
+
 K-Share is a local-network sharing system with three products:
 
 - `server`: the cross-platform background service that owns files, clipboard state, history, thumbnails, auth, and trustable endpoints

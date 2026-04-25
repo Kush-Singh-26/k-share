@@ -26,7 +26,8 @@ sealed class ConnectionOutcome {
     data class TrustRequired(
         val ip: String,
         val port: Int,
-        val certHash: String
+        val certHash: String,
+        val isGuest: Boolean = false
     ) : ConnectionOutcome()
 
     data class Failed(val message: String) : ConnectionOutcome()
@@ -102,7 +103,7 @@ class ConnectionCoordinator(
         return if (silent) {
             ConnectionOutcome.Failed("Server not trusted")
         } else {
-            ConnectionOutcome.TrustRequired(ip, port, certHash)
+            ConnectionOutcome.TrustRequired(ip, port, certHash, isGuest)
         }
     }
 
@@ -155,7 +156,8 @@ class ConnectionCoordinator(
     fun trustPendingServer(
         ip: String,
         port: Int,
-        certHash: String
+        certHash: String,
+        isGuest: Boolean
     ): ConnectionOutcome {
         val known = settings.getKnownServers()[certHash]
         val authCode = known?.authCode ?: settings.pairingCode
@@ -164,6 +166,6 @@ class ConnectionCoordinator(
         discoveryGateway.getNetworkId()?.let {
             settings.setLastServerIp(it, ip)
         }
-        return ConnectionOutcome.Connected(ip, port, certHash, null, false)
+        return ConnectionOutcome.Connected(ip, port, certHash, if (isGuest) "guest" else "admin", isGuest)
     }
 }

@@ -1,5 +1,8 @@
 # HTTP API
 
+> **Version**: 1.2
+> **Last Updated**: 2026-04-25
+
 This document describes the current server HTTP contract.
 
 ## Authentication
@@ -31,7 +34,7 @@ Response:
 {
   "status": "ok",
   "name": "K-Share Server",
-  "proto": "https",
+  "proto": "v1.2",
   "role": "admin"
 }
 ```
@@ -45,11 +48,11 @@ Notes:
 
 Purpose:
 
-- list files visible to the current role
+- list files and folders in the current effective root
 
 Query parameters:
 
-- `folder` optional relative folder name
+- `path` optional relative folder name
 
 Response:
 
@@ -60,7 +63,7 @@ Rules:
 - `admin` can see the full shared root.
 - `guest` can only see the public subtree.
 
-### `POST /upload?name=<filename>`
+### `POST /upload?path=<filename>`
 
 Purpose:
 
@@ -109,33 +112,34 @@ Optional query parameters:
 - `mode=append`
 - `channel=guest`
 
+Notes:
+
+- The request body is limited to 1MB.
+
 Events:
 
 - `clip` for the main clipboard
 - `clip_guest` for the guest clipboard
 - `history` when the main clipboard history changes
 
-### `GET /clipboard/image`
+...
+
+### `GET /thumbnail?path=<path>`
 
 Purpose:
 
-- read the shared clipboard image as PNG bytes
+- return a thumbnail for a file inside the effective root
 
-### `POST /clipboard/image`
+Rules:
 
-Purpose:
+- requires auth
+- the server may cache generated thumbnails on disk
 
-- write the shared clipboard image
-
-Events:
-
-- `clip_image`
-
-### `GET /clipboard/history`
+### `DELETE /delete?path=<path>`
 
 Purpose:
 
-- return the clipboard history list
+- move a file to trash
 
 Rules:
 
@@ -151,26 +155,6 @@ Rules:
 
 - admin only
 
-### `GET /thumbnail?name=<name>&folder=<folder>`
-
-Purpose:
-
-- return a thumbnail for a file inside the effective root
-
-Rules:
-
-- requires auth
-- the server may cache generated thumbnails on disk
-
-### `DELETE /delete?name=<filename>`
-
-Purpose:
-
-- move a file to trash
-
-Rules:
-
-- admin only
 
 ### `POST /open`
 

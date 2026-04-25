@@ -2,9 +2,12 @@ package discovery
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
 	"desktop-app/config"
+	"encoding/hex"
 	"fmt"
+	"io"
 	"math/rand"
 	"net"
 	"net/http"
@@ -18,30 +21,35 @@ const (
 	ConnectTimeoutMs = 350 // Balance between speed and reliability on slow networks
 )
 
+type DiscoveryResult struct {
+	IP       string
+	CertHash string
+}
+
 // FindServer scans for the server on local network
-func FindServer(port int, pairingCode string, onStatus func(string)) string {
+func FindServer(port int, pairingCode string, onStatus func(string)) DiscoveryResult {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	// 0. Try mDNS first
 	onStatus("Searching via mDNS...")
 	if entry, err := DiscoverMDNS(3 * time.Second); err == nil {
-		if checkIP(ctx, entry.IP, port, pairingCode) {
-			return entry.IP
+		if res, ok := checkIP(ctx, entry.IP, port, pairingCode); ok {
+			return res
 		}
 	}
 
 	// 1. Check Zone 0: Localhost
 	onStatus("Scanning Zone 0 (Localhost)...")
-	if checkIP(ctx, "127.0.0.1", port, pairingCode) {
-		return "127.0.0.1"
+	if res, ok := checkIP(ctx, "127.0.0.1", port, pairingCode); ok {
+		return res
 	}
 
 	// 2. Identify Local Interfaces and Subnets
 	interfaces, err := net.Interfaces()
 	if err != nil {
 		onStatus("Network error")
-		return ""
+		return DiscoveryResult{}
 	}
 
 	type subnetInfo struct {
@@ -77,15 +85,16 @@ func FindServer(port int, pairingCode string, onStatus func(string)) string {
 
 	if len(subnets) == 0 {
 		onStatus("No network found")
-		return ""
+		return DiscoveryResult{}
 	}
 
 	// 3. Check Zone Cache (Saved Networks)
 	onStatus("Checking saved networks...")
+	cfg := config.Get()
 	for _, sn := range subnets {
-		if savedIP, ok := config.Current.SavedNetworks[sn.subnet]; ok {
-			if checkIP(ctx, savedIP, port, pairingCode) {
-				return savedIP
+		if savedIP, ok := cfg.SavedNetworks[sn.subnet]; ok {
+			if res, ok := checkIP(ctx, savedIP, port, pairingCode); ok {
+				return res
 			}
 		}
 	}
@@ -105,19 +114,28 @@ func FindServer(port int, pairingCode string, onStatus func(string)) string {
 	})
 
 	// Parallel Scan
-	foundIP := make(chan string)
+	foundResult := make(chan DiscoveryResult, 1)
 	var wg sync.WaitGroup
 	jobs := make(chan string, len(ipsToScan))
+
+	// Use a shared client and transport to reuse connections efficiently
+	tr := &http.Transport{
+		TLSClientConfig:     &tls.Config{InsecureSkipVerify: true},
+		MaxIdleConns:        WorkerCount,
+		MaxIdleConnsPerHost: 2,
+		IdleConnTimeout:     5 * time.Second,
+	}
+	sharedClient := &http.Client{
+		Transport: tr,
+		Timeout:   ConnectTimeoutMs * time.Millisecond,
+	}
+	defer tr.CloseIdleConnections()
 
 	// Worker Pool
 	for w := 0; w < WorkerCount; w++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			client := &http.Client{
-				Timeout: ConnectTimeoutMs * time.Millisecond,
-			}
-
 			// Context-aware select to prevent goroutine leak
 			for {
 				select {
@@ -127,9 +145,9 @@ func FindServer(port int, pairingCode string, onStatus func(string)) string {
 					if !ok {
 						return
 					}
-					if checkTarget(ctx, client, ip, port, pairingCode) {
+					if res, ok := checkTarget(ctx, sharedClient, ip, port, pairingCode); ok {
 						select {
-						case foundIP <- ip:
+						case foundResult <- res:
 						case <-ctx.Done():
 						}
 						// Trigger cancel to stop other workers
@@ -157,36 +175,36 @@ func FindServer(port int, pairingCode string, onStatus func(string)) string {
 	// Wait for result or exhaustive search
 	go func() {
 		wg.Wait()
-		close(foundIP)
+		close(foundResult)
 	}()
 
 	select {
-	case ip := <-foundIP:
-		if ip != "" {
-			return ip
+	case res := <-foundResult:
+		if res.IP != "" {
+			return res
 		}
 	case <-ctx.Done():
 		// If context cancelled (found), drain channel if needed
 		select {
-		case ip := <-foundIP:
-			return ip
+		case res := <-foundResult:
+			return res
 		default:
 		}
 	}
 
 	onStatus("Server not found")
-	return ""
+	return DiscoveryResult{}
 }
 
 // checkIP checks a single IP synchronously
-func checkIP(ctx context.Context, ip string, port int, pairingCode string) bool {
+func checkIP(ctx context.Context, ip string, port int, pairingCode string) (DiscoveryResult, bool) {
 	client := &http.Client{
 		Timeout: ConnectTimeoutMs * time.Millisecond,
 	}
 	return checkTarget(ctx, client, ip, port, pairingCode)
 }
 
-func checkTarget(ctx context.Context, client *http.Client, ip string, port int, pairingCode string) bool {
+func checkTarget(ctx context.Context, client *http.Client, ip string, port int, pairingCode string) (DiscoveryResult, bool) {
 	// Configure client for HTTPS with self-signed certs if not already configured
 	if transport, ok := client.Transport.(*http.Transport); !ok || transport == nil {
 		tr := &http.Transport{
@@ -201,18 +219,30 @@ func checkTarget(ctx context.Context, client *http.Client, ip string, port int, 
 	url := fmt.Sprintf("https://%s:%d/ping", ip, port)
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
-		return false
+		return DiscoveryResult{}, false
 	}
+	req.Header.Set("Authorization", "Bearer "+pairingCode)
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return false
+		return DiscoveryResult{}, false
 	}
-	defer resp.Body.Close()
+	// Drain and close to reuse the connection
+	defer func() {
+		_, _ = io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+	}()
 
 	if resp.StatusCode != 200 {
-		return false
+		return DiscoveryResult{}, false
 	}
 
-	return true
+	// Capture Cert Hash
+	certHash := ""
+	if resp.TLS != nil && len(resp.TLS.PeerCertificates) > 0 {
+		hash := sha256.Sum256(resp.TLS.PeerCertificates[0].Raw)
+		certHash = hex.EncodeToString(hash[:])
+	}
+
+	return DiscoveryResult{IP: ip, CertHash: certHash}, true
 }

@@ -49,10 +49,13 @@ type App struct {
 	historyList *widget.List
 	connectBtn  *widget.Button
 	historyBtn  *widget.Button
+	backBtn     *widget.Button
 
 	// Data
-	filesBinding binding.UntypedList
-	historyItems []api.HistoryItem
+	filesBinding    binding.UntypedList
+	historyItems    []api.HistoryItem
+	currentPath     string
+	breadcrumbPath  binding.String
 
 	// Theme tracking
 	currentTheme string
@@ -89,27 +92,46 @@ func NewApp() *App {
 		downloadFolder: binding.NewString(),
 		statusText:     binding.NewString(),
 		clipboardText:  binding.NewString(),
+		breadcrumbPath: binding.NewString(),
 		filesBinding:   binding.NewUntypedList(),
 		historyItems:   []api.HistoryItem{},
+		currentPath:    "",
 		currentTheme:   "light",
 	}
 
 	// Load config - Removed redundant config.Load() as it's done in main.go
-	a.serverIP.Set(config.Current.ServerIP)
-	a.pairingCode.Set(config.Current.PairingCode)
-	a.downloadFolder.Set(config.Current.DownloadFolder)
+	cfg := config.Get()
+	a.serverIP.Set(cfg.ServerIP)
+	a.pairingCode.Set(cfg.PairingCode)
+	a.downloadFolder.Set(cfg.DownloadFolder)
 	a.statusText.Set("🔴 Disconnected")
+	a.breadcrumbPath.Set("📁 Root")
 	a.clipboardChannel = "" // Default to main
 	a.isGuest = false
-	a.session = session.New(config.Current.ServerIP, config.Current.PairingCode)
+	a.session = session.New(cfg.ServerIP, cfg.PairingCode)
 	a.apiClient = a.session.APIClient()
 	a.wsClient = a.session.WSClient()
-	a.fileOps = fileops.New(a.apiClient, config.Current.DownloadFolder)
+	a.fileOps = fileops.New(a.apiClient, cfg.DownloadFolder)
 	a.clipOps = clipboardops.New(a.apiClient)
 	a.historyOps = historyops.New(a.apiClient)
 	a.thumbs = thumbnails.New(a.apiClient)
 
 	return a
+}
+
+func (a *App) setStatus(msg string, duration time.Duration) {
+	a.statusText.Set(msg)
+	if duration > 0 {
+		time.AfterFunc(duration, func() {
+			if current, _ := a.statusText.Get(); current == msg {
+				if atomic.LoadInt32(&a.isConnected) == 1 {
+					a.statusText.Set("🟢 Connected")
+				} else {
+					a.statusText.Set("🔴 Disconnected")
+				}
+			}
+		})
+	}
 }
 
 func (a *App) Run() {
@@ -119,25 +141,25 @@ func (a *App) Run() {
 	// Redundant service creation removed to preserve initialization from NewApp()
 
 	// Setup WebSocket callbacks
-	a.wsClient.OnClipUpdate = func() {
+	a.wsClient.SetOnClipUpdate(func() {
 		if a.clipboardChannel == "" {
 			go a.fetchClipboard()
 		}
-	}
-	a.wsClient.OnClipImageUpdate = func() {
+	})
+	a.wsClient.SetOnClipImageUpdate(func() {
 		go a.fetchClipboardImage()
-	}
+	})
 
-	a.wsClient.OnHistoryUpdate = func() {
+	a.wsClient.SetOnHistoryUpdate(func() {
 		go func() {
 			a.loadHistory()
 		}()
-	}
-	a.wsClient.OnFilesUpdate = func() {
+	})
+	a.wsClient.SetOnFilesUpdate(func() {
 		go func() {
 			a.loadFiles()
 		}()
-	}
+	})
 
 	// Start clipboard image watcher
 	go func() {
@@ -154,12 +176,12 @@ func (a *App) Run() {
 
 			a.lastImageHash = hash
 			if !a.isGuest && atomic.LoadInt32(&a.isConnected) == 1 {
-				a.statusText.Set("⏏ Pushing image to server...")
+				a.setStatus("⏏ Pushing image to server...", 0)
 				err := a.clipOps.PushImage(context.Background(), data)
 				if err != nil {
-					a.statusText.Set("🔴 Push image failed: " + err.Error())
+					a.setStatus("🔴 Push image failed: "+err.Error(), 5*time.Second)
 				} else {
-					a.statusText.Set("✅ Image pushed to server")
+					a.setStatus("✅ Image pushed to server", 3*time.Second)
 				}
 			}
 		}
@@ -380,14 +402,12 @@ func (a *App) buildFilesPanel() fyne.CanvasObject {
 			row.infoLabel = widget.NewLabel("")
 
 			row.delBtn = widget.NewButton("🗑️", func() {})
+			row.dlBtn = widget.NewButton("📥", func() {})
 
 			labels := container.NewVBox(row.nameLabel, row.infoLabel)
-			row.container = container.NewBorder(nil, nil, row.thumb, row.delBtn, labels)
+			buttons := container.NewHBox(row.dlBtn, row.delBtn)
+			row.container = container.NewBorder(nil, nil, row.thumb, buttons, labels)
 
-			// Store row pointer in the container's metadata-like way or just return it
-			// Fyne widgets don't have a generic tag, but we can return the row.container
-			// and then use a map if we needed to, but for simple lists we can just
-			// find by index or use a helper.
 			return row.container
 		},
 		func(i binding.DataItem, obj fyne.CanvasObject) {
@@ -399,22 +419,37 @@ func (a *App) buildFilesPanel() fyne.CanvasObject {
 				return
 			}
 
-			var delBtn *widget.Button
+			// Manual child lookup (reliable across Fyne versions)
+			var delBtn, dlBtn *widget.Button
 			var thumbImg *canvas.Image
 			var infoBox *fyne.Container
 
 			for _, child := range border.Objects {
 				switch v := child.(type) {
-				case *widget.Button:
-					delBtn = v
+				case *fyne.Container:
+					// Check if this is the buttons container or the infoBox
+					if len(v.Objects) > 0 {
+						if _, ok := v.Objects[0].(*widget.Button); ok {
+							// Buttons container
+							for _, btnObj := range v.Objects {
+								if b, ok := btnObj.(*widget.Button); ok {
+									if b.Text == "📥" {
+										dlBtn = b
+									} else if b.Text == "🗑️" {
+										delBtn = b
+									}
+								}
+							}
+						} else {
+							infoBox = v
+						}
+					}
 				case *canvas.Image:
 					thumbImg = v
-				case *fyne.Container:
-					infoBox = v
 				}
 			}
 
-			if delBtn == nil || thumbImg == nil || infoBox == nil {
+			if delBtn == nil || thumbImg == nil || infoBox == nil || dlBtn == nil {
 				return
 			}
 
@@ -434,40 +469,44 @@ func (a *App) buildFilesPanel() fyne.CanvasObject {
 				return
 			}
 
-			// Configure delete button
+			// Configure buttons
 			delBtn.OnTapped = func() {
 				a.deleteFile(file.Name)
 			}
+			dlBtn.OnTapped = func() {
+				a.forceDownload(file)
+			}
+
 			if a.isGuest {
 				delBtn.Hide()
 			} else {
 				delBtn.Show()
 			}
 
-			row := presentation.BuildFileRow(file, a.isGuest)
+			uiRow := presentation.BuildFileRow(file, a.isGuest)
 
 			// Load thumbnail for images, show icon for others.
-			if row.IsImage {
-				a.thumbs.SetTarget(thumbImg, row.ThumbnailKey)
+			if uiRow.IsImage {
+				a.thumbs.SetTarget(thumbImg, uiRow.ThumbnailKey)
 				thumbImg.Image = nil
 				thumbImg.Resource = theme.FileImageIcon() // Placeholder until loaded
 				thumbImg.Refresh()
-				go a.thumbs.Request(row.ThumbnailKey, thumbImg)
+				go a.thumbs.Request(uiRow.ThumbnailKey, thumbImg)
 			} else {
 				a.thumbs.SetTarget(thumbImg, "")
 				thumbImg.Image = nil
-				if row.IsDirectory {
+				if uiRow.IsDirectory {
 					thumbImg.Resource = theme.FolderIcon()
 				} else {
-					thumbImg.Resource = getFileResource(row.DisplayName)
+					thumbImg.Resource = getFileResource(uiRow.DisplayName)
 				}
 				thumbImg.Refresh()
 			}
 
 			// First line: icon + name + tag
-			nameLabel.SetText(row.Icon + " " + row.DisplayName + row.GuestLabel)
+			nameLabel.SetText(uiRow.Icon + " " + uiRow.DisplayName + uiRow.GuestLabel)
 			// Second line: size • timestamp
-			infoLabel.SetText(row.Info)
+			infoLabel.SetText(uiRow.Info)
 		},
 	)
 
@@ -483,6 +522,13 @@ func (a *App) buildFilesPanel() fyne.CanvasObject {
 	refreshBtn := widget.NewButton("🔄 Refresh", func() {
 		a.loadFiles()
 	})
+
+	downloadDirBtn := widget.NewButton("📥 Download All", func() {
+		a.forceDownload(api.FileInfo{
+			Name:        a.currentPath,
+			IsDirectory: true,
+		})
+	})
 	
 	// Search input
 	searchEntry := widget.NewEntry()
@@ -491,13 +537,21 @@ func (a *App) buildFilesPanel() fyne.CanvasObject {
 		go a.searchFiles(query)
 	}
 
+	breadcrumb := widget.NewLabelWithData(a.breadcrumbPath)
+	breadcrumb.TextStyle = fyne.TextStyle{Bold: true, Italic: true}
+	
+	a.backBtn = widget.NewButtonWithIcon("Back", theme.NavigateBackIcon(), func() {
+		a.navigateUp()
+	})
+	a.backBtn.Disable() // Start disabled
+
 	header := container.NewVBox(
 		widget.NewLabel("📤 Upload to server"),
 		uploadBtns,
 		widget.NewSeparator(),
 		widget.NewLabel("📥 Download from server (click to download)"),
 		searchEntry,
-		refreshBtn,
+		container.NewHBox(a.backBtn, breadcrumb, layout.NewSpacer(), downloadDirBtn, refreshBtn),
 	)
 
 	return container.NewBorder(
@@ -562,7 +616,7 @@ func (a *App) rebuildHistoryUI() {
 
 		restoreBtn := widget.NewButton("📋", func() {
 			a.clipboardText.Set(currentItem.Text)
-			a.statusText.Set("📋 Restored from history")
+			a.setStatus("📋 Restored from history", 3*time.Second)
 			if a.historyWindow != nil {
 				a.historyWindow.Close()
 			}
@@ -580,6 +634,7 @@ func (a *App) rebuildHistoryUI() {
 type fileListRow struct {
 	thumb     *canvas.Image
 	delBtn    *widget.Button
+	dlBtn     *widget.Button
 	nameLabel *widget.Label
 	infoLabel *widget.Label
 	container fyne.CanvasObject
@@ -593,11 +648,12 @@ func (a *App) showSettingsPopup() {
 	content.Add(widget.NewLabelWithStyle("Saved Server IPs per Subnet", fyne.TextAlignCenter, fyne.TextStyle{Bold: true}))
 	content.Add(widget.NewSeparator())
 
-	if len(config.Current.SavedNetworks) == 0 {
+	cfg := config.Get()
+	if len(cfg.SavedNetworks) == 0 {
 		content.Add(widget.NewLabel("No saved networks yet."))
 	}
 
-	for subnet, ip := range config.Current.SavedNetworks {
+	for subnet, ip := range cfg.SavedNetworks {
 		s, i := subnet, ip // capture
 		row := container.NewBorder(nil, nil, nil,
 			widget.NewButton("Delete", func() {
@@ -631,17 +687,24 @@ func (a *App) searchFiles(query string) {
 	
 	results, err := a.apiClient.Search(ctx, query)
 	if err != nil {
-		a.statusText.Set("🔴 Search failed: " + err.Error())
+		a.setStatus("🔴 Search failed: "+err.Error(), 5*time.Second)
 		return
 	}
 	
 	// Clear and update binding
 	a.filesBinding.Set(nil)
 	for i := range results {
-		a.filesBinding.Append(results[i])
+		// Convert SearchResult to FileInfo to avoid UI panic
+		file := api.FileInfo{
+			Name:        results[i].Path,
+			IsDirectory: results[i].IsDirectory,
+			Size:        results[i].Size,
+			ModTime:     results[i].ModTime,
+		}
+		a.filesBinding.Append(file)
 	}
 	
-	a.statusText.Set(fmt.Sprintf("✅ Found %d matching files", len(results)))
+	a.setStatus(fmt.Sprintf("✅ Found %d matching files", len(results)), 3*time.Second)
 }
 
 func getFileResource(filename string) fyne.Resource {

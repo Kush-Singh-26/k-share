@@ -44,7 +44,7 @@ func (b BrandingConfig) GetIcon(icon string, fallback string) string {
 }
 
 func RenderLogo(maxWidth int) string {
-	if maxWidth < 40 {
+	if maxWidth < 15 {
 		return lipgloss.NewStyle().Foreground(PrimaryColor).Bold(true).Render("K-SHARE")
 	}
 	
@@ -54,6 +54,7 @@ func RenderLogo(maxWidth int) string {
 	
 	for _, line := range lines {
 		trimmed := strings.TrimRight(line, " ")
+		trimmed = strings.TrimRight(trimmed, "\u2800") // Trim Braille blank
 		if len(trimmed) == 0 {
 			continue
 		}

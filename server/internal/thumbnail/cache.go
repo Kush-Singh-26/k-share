@@ -3,6 +3,7 @@ package thumbnail
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
 	"image"
 	"image/jpeg"
 	"image/png"
@@ -22,13 +23,13 @@ import (
 type Store struct {
 	cacheDir string
 	queue    chan genRequest
+	stopCh   chan struct{}
 	mu       sync.Mutex
 }
 
 type genRequest struct {
 	rootDir string
-	name    string
-	folder  string
+	relPath string
 }
 
 func New() *Store {
@@ -47,8 +48,12 @@ func NewWithCacheDir(cacheDir string) *Store {
 	s := &Store{
 		cacheDir: cacheDir,
 		queue:    make(chan genRequest, 64),
+		stopCh:   make(chan struct{}),
 	}
-	go s.ProcessQueue()
+	// Start a pool of workers for concurrent thumbnail generation
+	for i := 0; i < 4; i++ {
+		go s.ProcessQueue()
+	}
 	return s
 }
 
@@ -56,17 +61,15 @@ func (s *Store) CacheDir() string {
 	return s.cacheDir
 }
 
-func (s *Store) CachePath(relFilePath string, modTime time.Time) string {
-	h := sha256.New()
-	h.Write([]byte(relFilePath))
-	h.Write([]byte(modTime.String()))
-	hash := hex.EncodeToString(h.Sum(nil))
-	return filepath.Join(s.cacheDir, hash+".jpg")
+func (s *Store) CachePath(relPath string, modTime time.Time, size int64) string {
+	hash := sha256.New()
+	hash.Write([]byte(relPath))
+	hash.Write([]byte(fmt.Sprintf("%d", modTime.UnixNano())))
+	hash.Write([]byte(fmt.Sprintf("%d", size)))
+	return filepath.Join(s.cacheDir, hex.EncodeToString(hash.Sum(nil))+".jpg")
 }
 
-func (s *Store) Serve(rootDir, name, folder string, w http.ResponseWriter, r *http.Request) error {
-	relPath := filepath.Join(folder, name)
-
+func (s *Store) Serve(rootDir, relPath string, w http.ResponseWriter, r *http.Request) error {
 	filePath, err := serverstorage.ResolveWithinRoot(rootDir, relPath)
 	if err != nil {
 		http.Error(w, "Invalid path", http.StatusBadRequest)
@@ -81,24 +84,25 @@ func (s *Store) Serve(rootDir, name, folder string, w http.ResponseWriter, r *ht
 
 	relFromRoot, _ := filepath.Rel(rootDir, filePath)
 	if relFromRoot == "" {
-		relFromRoot = name
+		relFromRoot = relPath
 	}
 
-	cachePath := s.CachePath(relFromRoot, info.ModTime())
+	cachePath := s.CachePath(relFromRoot, info.ModTime(), info.Size())
 	if _, err := os.Stat(cachePath); err == nil {
+		// Update access time for LRU eviction
+		_ = os.Chtimes(cachePath, time.Now(), time.Now())
 		w.Header().Set("Content-Type", "image/jpeg")
 		http.ServeFile(w, r, cachePath)
 		return nil
 	}
 
 	// Queue async generation; for now return a placeholder response so the request doesn't block.
-	s.QueueGeneration(rootDir, name, folder)
+	s.QueueGeneration(rootDir, relPath)
 	http.Error(w, "Thumbnail not ready", http.StatusAccepted)
 	return nil
 }
 
-func (s *Store) generate(rootDir, name, folder string) {
-	relPath := filepath.Join(folder, name)
+func (s *Store) generate(rootDir, relPath string) {
 	filePath, err := serverstorage.ResolveWithinRoot(rootDir, relPath)
 	if err != nil {
 		return
@@ -107,11 +111,15 @@ func (s *Store) generate(rootDir, name, folder string) {
 	if err != nil {
 		return
 	}
+	// DoS Safety: Don't try to decode images larger than 25MB
+	if info.Size() > 25*1024*1024 {
+		return
+	}
 	relFromRoot, _ := filepath.Rel(rootDir, filePath)
 	if relFromRoot == "" {
-		relFromRoot = name
+		relFromRoot = relPath
 	}
-	cachePath := s.CachePath(relFromRoot, info.ModTime())
+	cachePath := s.CachePath(relFromRoot, info.ModTime(), info.Size())
 	if _, err := os.Stat(cachePath); err == nil {
 		return
 	}
@@ -122,7 +130,7 @@ func (s *Store) generate(rootDir, name, folder string) {
 	}
 	defer file.Close()
 
-	ext := strings.ToLower(filepath.Ext(name))
+	ext := strings.ToLower(filepath.Ext(relPath))
 	var img image.Image
 	if ext == ".jpg" || ext == ".jpeg" {
 		img, _ = jpeg.Decode(file)
@@ -141,9 +149,11 @@ func (s *Store) generate(rootDir, name, folder string) {
 }
 
 // QueueGeneration adds a thumbnail generation job to the async queue.
-func (s *Store) QueueGeneration(rootDir, name, folder string) {
+func (s *Store) QueueGeneration(rootDir, relPath string) {
 	select {
-	case s.queue <- genRequest{rootDir: rootDir, name: name, folder: folder}:
+	case <-s.stopCh:
+		return
+	case s.queue <- genRequest{rootDir: rootDir, relPath: relPath}:
 	default:
 		// Queue is full; drop the request silently.
 	}
@@ -151,9 +161,21 @@ func (s *Store) QueueGeneration(rootDir, name, folder string) {
 
 // ProcessQueue runs in a background goroutine and processes generation jobs.
 func (s *Store) ProcessQueue() {
-	for req := range s.queue {
-		s.generate(req.rootDir, req.name, req.folder)
+	for {
+		select {
+		case req, ok := <-s.queue:
+			if !ok {
+				return
+			}
+			s.generate(req.rootDir, req.relPath)
+		case <-s.stopCh:
+			return
+		}
 	}
+}
+
+func (s *Store) Stop() {
+	close(s.stopCh)
 }
 
 func (s *Store) Evict(maxSize int64) {
@@ -197,8 +219,14 @@ func (s *Store) Evict(maxSize int64) {
 }
 
 func (s *Store) StartEviction(maxSize int64, interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
 	for {
-		time.Sleep(interval)
-		s.Evict(maxSize)
+		select {
+		case <-ticker.C:
+			s.Evict(maxSize)
+		case <-s.stopCh:
+			return
+		}
 	}
 }

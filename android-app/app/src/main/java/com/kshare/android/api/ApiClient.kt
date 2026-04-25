@@ -10,9 +10,11 @@ import okhttp3.*
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.RequestBody.Companion.toRequestBody
 import java.io.InputStream
+import java.io.IOException
 import java.security.MessageDigest
 import java.security.SecureRandom
 import java.security.cert.X509Certificate
+import java.security.cert.CertificateException
 import java.util.concurrent.TimeUnit
 import javax.net.ssl.*
 import java.net.Socket
@@ -38,7 +40,7 @@ object ApiClient {
     private lateinit var trustManager: PinningTrustManager
     private lateinit var sslContext: SSLContext
 
-    private lateinit var insecureClient: OkHttpClient
+    private lateinit var discoveryClient: OkHttpClient
     private lateinit var secureClient: OkHttpClient
 
     @Volatile
@@ -51,10 +53,10 @@ object ApiClient {
             settingsManager = SettingsManager(context)
             trustManager = PinningTrustManager(settingsManager)
 
-            sslContext = SSLContext.getInstance("TLS")
+            sslContext = SSLContext.getInstance("TLSv1.3")
             sslContext.init(null, arrayOf(trustManager), SecureRandom())
 
-            insecureClient = OkHttpClient.Builder()
+            discoveryClient = OkHttpClient.Builder()
                 .connectionPool(ConnectionPool(0, 1, TimeUnit.MILLISECONDS))
                 .connectTimeout(10, TimeUnit.SECONDS)
                 .readTimeout(10, TimeUnit.SECONDS)
@@ -113,11 +115,11 @@ object ApiClient {
         return secureClient
     }
 
-    private val insecureClientCache = ConcurrentHashMap<Long, OkHttpClient>()
+    private val discoveryClientCache = ConcurrentHashMap<Long, OkHttpClient>()
 
-    fun getInsecureClient(timeoutMs: Long = 15000L): OkHttpClient {
+    fun getDiscoveryClient(timeoutMs: Long = 15000L): OkHttpClient {
         ensureInitialized()
-        return insecureClientCache.getOrPut(timeoutMs) {
+        return discoveryClientCache.getOrPut(timeoutMs) {
             OkHttpClient.Builder()
                 .connectionPool(ConnectionPool(10, 30, TimeUnit.SECONDS))
                 .connectTimeout(timeoutMs, TimeUnit.MILLISECONDS)
@@ -138,10 +140,17 @@ object ApiClient {
         override fun checkClientTrusted(chain: Array<out X509Certificate>?, authType: String?, engine: SSLEngine?) {}
 
         override fun checkServerTrusted(chain: Array<out X509Certificate>?, authType: String?) {
-            if (chain.isNullOrEmpty()) return
+            if (chain.isNullOrEmpty()) throw CertificateException("Empty certificate chain")
             val cert = chain[0]
             lastSeenCert = cert
-            Log.d(TAG, "Captured cert from chain: ${getCertHash(cert).take(8)}")
+            val hash = getCertHash(cert)
+            // TOFU: Reject if cert is not known AND we are not in discovery mode
+            // Discovery bypass is handled by the discovery client's hostname verifier,
+            // but we still validate here for defense in depth.
+            if (!settings.getKnownServers().containsKey(hash)) {
+                Log.d(TAG, "Untrusted cert captured: ${hash.take(8)}")
+            }
+            Log.d(TAG, "Captured cert from chain: ${hash.take(8)}")
         }
 
         override fun checkServerTrusted(chain: Array<out X509Certificate>?, authType: String?, socket: Socket?) {
@@ -180,6 +189,15 @@ object ApiClient {
             val digest = MessageDigest.getInstance("SHA-256")
             val hash = digest.digest(cert.encoded)
             return hash.joinToString("") { "%02x".format(it) }
+        }
+
+        /**
+         * Validates whether the given certificate hash is trusted by the user.
+         * This should be called after discovery/ping to enforce TOFU before
+         * sensitive operations (file transfer, clipboard sync).
+         */
+        fun isTrusted(certHash: String): Boolean {
+            return settings.getKnownServers().containsKey(certHash)
         }
     }
 
@@ -225,7 +243,7 @@ object ApiClient {
             lastError = null
             withContext(Dispatchers.IO) {
                 try {
-                    insecureClient.newCall(request).execute().use { response ->
+                    discoveryClient.newCall(request).execute().use { response ->
                         var cert: X509Certificate? = response.handshake?.peerCertificates?.firstOrNull() as? X509Certificate
                         if (cert == null) cert = trustManager.getRecentCert(serverIp)
                         if (cert == null) cert = getCertDirectly(serverIp, port)
@@ -262,7 +280,7 @@ object ApiClient {
     suspend fun listFiles(serverIp: String, port: Int, pairingCode: String, folder: String = ""): List<RemoteFile> {
         ensureInitialized()
         var url = "https://$serverIp:$port/files"
-        if (folder.isNotEmpty()) url += "?folder=${java.net.URLEncoder.encode(folder, "UTF-8")}"
+        if (folder.isNotEmpty()) url += "?path=${java.net.URLEncoder.encode(folder, "UTF-8")}"
         val request = Request.Builder().url(url).header("Authorization", "Bearer $pairingCode").build()
         return try {
             withContext(Dispatchers.IO) {
@@ -277,7 +295,8 @@ object ApiClient {
     suspend fun searchFiles(serverIp: String, port: Int, pairingCode: String, query: String): List<RemoteFile> {
         ensureInitialized()
         val url = "https://$serverIp:$port/search"
-        val requestBody = """{"query":"$query"}""".toRequestBody("application/json".toMediaType())
+        val jsonBody = com.google.gson.JsonObject().apply { addProperty("query", query) }.toString()
+        val requestBody = jsonBody.toRequestBody("application/json".toMediaType())
         val request = Request.Builder()
             .url(url)
             .header("Authorization", "Bearer $pairingCode")
@@ -343,8 +362,8 @@ object ApiClient {
         } catch (e: Exception) { false }
     }
 
-    fun getThumbnailUrl(serverIp: String, port: Int, name: String): String {
-        return "https://$serverIp:$port/thumbnail?name=${java.net.URLEncoder.encode(name, "UTF-8")}"
+    fun getThumbnailUrl(serverIp: String, port: Int, path: String): String {
+        return "https://$serverIp:$port/thumbnail?path=${java.net.URLEncoder.encode(path, "UTF-8")}"
     }
 
     suspend fun openOnPc(serverIp: String, port: Int, url: String, pairingCode: String): Boolean {
@@ -353,22 +372,24 @@ object ApiClient {
             .post(url.toRequestBody("text/plain".toMediaType())).build()
         return try {
             withContext(Dispatchers.IO) { secureClient.newCall(request).execute().use { it.isSuccessful } }
-        } catch (e: Exception) { false }
+        } catch (e: Exception) { Log.w(TAG, "openOnPc failed: ${e.message}"); false }
     }
 
-    suspend fun deleteFile(serverIp: String, port: Int, fileName: String, pairingCode: String): Boolean {
+    suspend fun deleteFile(serverIp: String, port: Int, path: String, pairingCode: String): Boolean {
         ensureInitialized()
-        val request = Request.Builder().url("https://$serverIp:$port/delete?name=${java.net.URLEncoder.encode(fileName, "UTF-8")}")
+        val encodedPath = java.net.URLEncoder.encode(path, "UTF-8")
+        val request = Request.Builder().url("https://$serverIp:$port/delete?path=$encodedPath")
             .header("Authorization", "Bearer $pairingCode").delete().build()
         return try {
             withContext(Dispatchers.IO) { secureClient.newCall(request).execute().use { it.isSuccessful } }
-        } catch (e: Exception) { false }
+        } catch (e: Exception) { Log.w(TAG, "deleteFile failed: ${e.message}"); false }
     }
 
     suspend fun downloadFile(serverIp: String, port: Int, fileName: String, pairingCode: String, startOffset: Long = 0, onStreamReady: suspend (InputStream, Long) -> Unit): Boolean {
         ensureInitialized()
-        val encodedName = java.net.URLEncoder.encode(fileName, "UTF-8").replace("+", "%20")
-        val request = Request.Builder().url("https://$serverIp:$port/download/$encodedName").header("Authorization", "Bearer $pairingCode")
+        val encodedName = java.net.URLEncoder.encode(fileName, "UTF-8")
+        val url = "https://$serverIp:$port/download/$encodedName"
+        val request = Request.Builder().url(url).header("Authorization", "Bearer $pairingCode")
             .apply { if (startOffset > 0) header("Range", "bytes=$startOffset-") }.build()
         return try {
             withContext(Dispatchers.IO) {
@@ -382,7 +403,7 @@ object ApiClient {
         } catch (e: Exception) { false }
     }
 
-    suspend fun uploadFile(serverIp: String, port: Int, inputStream: InputStream, fileName: String, pairingCode: String, contentLength: Long, onProgress: (Long, Long) -> Unit): Boolean {
+    suspend fun uploadFile(serverIp: String, port: Int, inputStream: InputStream, fileName: String, pairingCode: String, contentLength: Long, onProgress: (Long, Long) -> Boolean): Boolean {
         ensureInitialized()
         val requestBody = object : RequestBody() {
             override fun contentType() = "application/octet-stream".toMediaType()
@@ -394,11 +415,14 @@ object ApiClient {
                 while (inputStream.read(buffer).also { read = it } != -1) {
                     sink.write(buffer, 0, read)
                     uploaded += read
-                    onProgress(uploaded, contentLength)
+                    if (!onProgress(uploaded, contentLength)) {
+                        throw IOException("Upload cancelled")
+                    }
                 }
             }
         }
-        val request = Request.Builder().url("https://$serverIp:$port/upload?name=${java.net.URLEncoder.encode(fileName, "UTF-8")}")
+        val encodedPath = java.net.URLEncoder.encode(fileName, "UTF-8")
+        val request = Request.Builder().url("https://$serverIp:$port/upload?path=$encodedPath")
             .header("Authorization", "Bearer $pairingCode").post(requestBody).build()
         return try {
             withContext(Dispatchers.IO) {

@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"sync"
@@ -15,23 +16,45 @@ import (
 
 type Client struct {
 	baseURL    string
+	serverIP   string
 	authCode   string
 	httpClient *http.Client
 	mu         sync.RWMutex
 }
 
+func normalizeAddress(addr string) string {
+	if addr == "" {
+		return ""
+	}
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		// No port specified, add default
+		return net.JoinHostPort(addr, "26260")
+	}
+	if port == "" {
+		return net.JoinHostPort(host, "26260")
+	}
+	return addr
+}
+
 func NewClient(serverIP string, authCode string) *Client {
+	serverIP = normalizeAddress(serverIP)
+	host, _, _ := net.SplitHostPort(serverIP)
+	if host == "" {
+		host = serverIP
+	}
+
 	// Use TOFU certificate pinning
 	tr := &http.Transport{
-		TLSClientConfig: crypto.CreateTLSConfig(nil),
+		TLSClientConfig: crypto.CreateTLSConfig(host, nil),
 	}
 	return &Client{
 		baseURL:  "https://" + serverIP,
+		serverIP: serverIP,
 		authCode: authCode,
 		httpClient: &http.Client{
-			// We use a reasonably long default timeout, but contexts should override this.
-			Timeout:   1 * time.Hour, 
 			Transport: tr,
+			Timeout:   30 * time.Second,
 		},
 	}
 }
@@ -45,7 +68,19 @@ func (c *Client) SetAuthCode(code string) {
 func (c *Client) SetServerIP(ip string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	ip = normalizeAddress(ip)
+	c.serverIP = ip
 	c.baseURL = "https://" + ip
+
+	host, _, _ := net.SplitHostPort(ip)
+	if host == "" {
+		host = ip
+	}
+
+	// Update transport with new host for SNI/verification
+	if tr, ok := c.httpClient.Transport.(*http.Transport); ok {
+		tr.TLSClientConfig = crypto.CreateTLSConfig(host, nil)
+	}
 }
 
 func (c *Client) getBaseURL() string {
@@ -94,13 +129,26 @@ func (c *Client) Ping(ctx context.Context) (string, error) {
 	return result["role"], nil
 }
 
+// PingDefault is a convenience wrapper with a default 10s timeout.
+func (c *Client) PingDefault() (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	return c.Ping(ctx)
+}
+
 // GetClipboard fetches current clipboard text from server
 func (c *Client) GetClipboard(ctx context.Context, channel string) (string, error) {
-	targetURL := c.getBaseURL() + "/clipboard"
-	if channel != "" {
-		targetURL += "?channel=" + channel
+	u, err := url.Parse(c.getBaseURL() + "/clipboard")
+	if err != nil {
+		return "", err
 	}
-	req, err := http.NewRequestWithContext(ctx, "GET", targetURL, nil)
+	if channel != "" {
+		q := u.Query()
+		q.Set("channel", channel)
+		u.RawQuery = q.Encode()
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "GET", u.String(), nil)
 	if err != nil {
 		return "", err
 	}
@@ -152,7 +200,7 @@ func (c *Client) GetThumbnail(ctx context.Context, filename string) ([]byte, err
 		return nil, err
 	}
 	q := u.Query()
-	q.Set("name", filename)
+	q.Set("path", filename)
 	u.RawQuery = q.Encode()
 
 	req, err := http.NewRequestWithContext(ctx, "GET", u.String(), nil)
@@ -176,11 +224,17 @@ func (c *Client) GetThumbnail(ctx context.Context, filename string) ([]byte, err
 
 // PushClipboard sends clipboard text to server
 func (c *Client) PushClipboard(ctx context.Context, text string, channel string) error {
-	targetURL := c.getBaseURL() + "/clipboard"
-	if channel != "" {
-		targetURL += "?channel=" + channel
+	u, err := url.Parse(c.getBaseURL() + "/clipboard")
+	if err != nil {
+		return err
 	}
-	req, err := http.NewRequestWithContext(ctx, "POST", targetURL, bytes.NewBufferString(text))
+	if channel != "" {
+		q := u.Query()
+		q.Set("channel", channel)
+		u.RawQuery = q.Encode()
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "POST", u.String(), bytes.NewBufferString(text))
 	if err != nil {
 		return err
 	}
@@ -237,6 +291,13 @@ type HistoryItem struct {
 	Timestamp time.Time `json:"timestamp"`
 }
 
+// ListFilesDefault is a convenience wrapper with a default 30s timeout.
+func (c *Client) ListFilesDefault(path string) ([]FileInfo, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	return c.ListFiles(ctx, path)
+}
+
 // ListFiles lists files in the server's directory
 func (c *Client) ListFiles(ctx context.Context, path string) ([]FileInfo, error) {
 	reqURL, err := url.Parse(c.getBaseURL() + "/files")
@@ -276,7 +337,8 @@ func (c *Client) ListFiles(ctx context.Context, path string) ([]FileInfo, error)
 
 // DownloadFile downloads a file from server
 func (c *Client) DownloadFile(ctx context.Context, filename string, folder string) (io.ReadCloser, error) {
-	targetURL := fmt.Sprintf("%s/download/%s", c.getBaseURL(), filename)
+	// P2: safely escape path segment
+	targetURL := fmt.Sprintf("%s/download/%s", c.getBaseURL(), url.PathEscape(filename))
 	req, err := http.NewRequestWithContext(ctx, "GET", targetURL, nil)
 	if err != nil {
 		return nil, err
@@ -298,15 +360,15 @@ func (c *Client) DownloadFile(ctx context.Context, filename string, folder strin
 
 // UploadFile uploads a file to server
 func (c *Client) UploadFile(ctx context.Context, filename string, reader io.Reader) error {
-	baseURL, err := url.Parse(c.getBaseURL() + "/upload")
+	u, err := url.Parse(c.getBaseURL() + "/upload")
 	if err != nil {
 		return err
 	}
-	params := url.Values{}
-	params.Add("name", filename)
-	baseURL.RawQuery = params.Encode()
+	params := u.Query()
+	params.Set("path", filename)
+	u.RawQuery = params.Encode()
 
-	req, err := http.NewRequestWithContext(ctx, "POST", baseURL.String(), reader)
+	req, err := http.NewRequestWithContext(ctx, "POST", u.String(), reader)
 	if err != nil {
 		return err
 	}
@@ -354,8 +416,15 @@ func (c *Client) GetHistory(ctx context.Context) ([]HistoryItem, error) {
 
 // DeleteHistoryItem deletes a history item by ID
 func (c *Client) DeleteHistoryItem(ctx context.Context, id string) error {
-	targetURL := c.getBaseURL() + "/clipboard/history?id=" + id
-	req, err := http.NewRequestWithContext(ctx, "DELETE", targetURL, nil)
+	u, err := url.Parse(c.getBaseURL() + "/clipboard/history")
+	if err != nil {
+		return err
+	}
+	q := u.Query()
+	q.Set("id", id)
+	u.RawQuery = q.Encode()
+
+	req, err := http.NewRequestWithContext(ctx, "DELETE", u.String(), nil)
 	if err != nil {
 		return err
 	}
@@ -376,8 +445,15 @@ func (c *Client) DeleteHistoryItem(ctx context.Context, id string) error {
 
 // DeleteFile moves a file to trash
 func (c *Client) DeleteFile(ctx context.Context, filename string) error {
-	targetURL := c.getBaseURL() + "/delete?name=" + url.QueryEscape(filename)
-	req, err := http.NewRequestWithContext(ctx, "DELETE", targetURL, nil)
+	u, err := url.Parse(c.getBaseURL() + "/delete")
+	if err != nil {
+		return err
+	}
+	q := u.Query()
+	q.Set("path", filename)
+	u.RawQuery = q.Encode()
+
+	req, err := http.NewRequestWithContext(ctx, "DELETE", u.String(), nil)
 	if err != nil {
 		return err
 	}

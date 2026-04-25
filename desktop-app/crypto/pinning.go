@@ -125,9 +125,10 @@ func (pm *PinningManager) RemoveTrust(certHash string) {
 
 // CreateTLSConfig creates a TLS config with certificate capture
 // It allows connection but captures the cert for verification
-func CreateTLSConfig(onCertSeen func(*CertInfo)) *tls.Config {
+func CreateTLSConfig(serverName string, onCertSeen func(*CertInfo)) *tls.Config {
 	return &tls.Config{
 		InsecureSkipVerify: true, // We do our own TOFU verification
+		ServerName:         serverName,
 		VerifyPeerCertificate: func(rawCerts [][]byte, verifiedChains [][]*x509.Certificate) error {
 			if len(rawCerts) == 0 {
 				return errors.New("no certificates presented")
@@ -145,9 +146,15 @@ func CreateTLSConfig(onCertSeen func(*CertInfo)) *tls.Config {
 
 			if onCertSeen != nil {
 				onCertSeen(certInfo)
+				return nil
 			}
 
-			return nil // Allow connection, app layer does trust check
+			// If no capture callback, enforce trust
+			if !Manager.IsTrusted(certInfo.Hash) {
+				return ErrCertificateNotTrusted
+			}
+
+			return nil
 		},
 	}
 }

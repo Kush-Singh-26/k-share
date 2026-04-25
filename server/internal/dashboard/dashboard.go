@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Kush-Singh-26/k-share/server/internal/clipboardstore"
@@ -23,6 +24,7 @@ var staticFiles embed.FS
 
 type Handlers struct {
 	Config    *config.Config
+	ConfigMu  *sync.RWMutex
 	Clipboard *clipboardstore.Store
 	History   *history.Store
 	Hub       *realtime.Hub
@@ -39,11 +41,16 @@ func (h *Handlers) ServeDashboard() http.Handler {
 }
 
 func (h *Handlers) HandleStatus(w http.ResponseWriter, r *http.Request, ip string, startTime time.Time) {
+	h.ConfigMu.RLock()
+	port := h.Config.Port
+	sharedDir := h.Config.SharedDir
+	h.ConfigMu.RUnlock()
+
 	status := map[string]interface{}{
 		"uptime":      time.Since(startTime).String(),
 		"ip":          ip,
-		"port":        h.Config.Port,
-		"sharedDir":   h.Config.SharedDir,
+		"port":        port,
+		"sharedDir":   sharedDir,
 		"clientCount": h.Hub.ClientCount(),
 	}
 	h.writeJSON(w, status)
@@ -70,6 +77,8 @@ func validateConfig(cfg config.Config) error {
 
 func (h *Handlers) HandleConfig(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodGet {
+		h.ConfigMu.RLock()
+		defer h.ConfigMu.RUnlock()
 		h.writeJSON(w, h.Config)
 		return
 	}
@@ -83,12 +92,16 @@ func (h *Handlers) HandleConfig(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
+		h.ConfigMu.Lock()
 		*h.Config = newCfg
+		h.ConfigMu.Unlock()
+
 		if err := config.Save(newCfg); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
 		h.writeJSON(w, map[string]string{"status": "ok"})
+		h.Hub.Notify("files") // Trigger index rebuild if shared_dir changed
 		return
 	}
 	http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -100,6 +113,7 @@ func (h *Handlers) HandleRotateCodes(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	role := r.URL.Query().Get("role")
+	h.ConfigMu.Lock()
 	if role == "admin" {
 		h.Config.AdminCode = config.RandomCode(config.DefaultCodeLength)
 	} else if role == "guest" {
@@ -108,11 +122,14 @@ func (h *Handlers) HandleRotateCodes(w http.ResponseWriter, r *http.Request) {
 		h.Config.AdminCode = config.RandomCode(config.DefaultCodeLength)
 		h.Config.GuestCode = config.RandomCode(config.DefaultCodeLength)
 	}
-	if err := config.Save(*h.Config); err != nil {
+	currentCfg := *h.Config
+	h.ConfigMu.Unlock()
+
+	if err := config.Save(currentCfg); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	h.writeJSON(w, h.Config)
+	h.writeJSON(w, &currentCfg)
 }
 
 func (h *Handlers) HandleLogs(w http.ResponseWriter, r *http.Request) {
@@ -132,14 +149,18 @@ func (h *Handlers) HandleLogs(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handlers) HandleFiles(w http.ResponseWriter, r *http.Request) {
 	var files []map[string]interface{}
-	err := filepath.Walk(h.Config.SharedDir, func(path string, info os.FileInfo, err error) error {
+	h.ConfigMu.RLock()
+	sharedDir := h.Config.SharedDir
+	h.ConfigMu.RUnlock()
+
+	err := filepath.Walk(sharedDir, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return nil
 		}
-		if path == h.Config.SharedDir {
+		if path == sharedDir {
 			return nil
 		}
-		rel, _ := filepath.Rel(h.Config.SharedDir, path)
+		rel, _ := filepath.Rel(sharedDir, path)
 		files = append(files, map[string]interface{}{
 			"name":  rel,
 			"dir":   info.IsDir(),
@@ -160,12 +181,17 @@ func (h *Handlers) HandleClearTrash(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	trashPath := filepath.Join(h.Config.SharedDir, ".trash")
+	h.ConfigMu.RLock()
+	sharedDir := h.Config.SharedDir
+	h.ConfigMu.RUnlock()
+
+	trashPath := filepath.Join(sharedDir, ".trash")
 	if err := os.RemoveAll(trashPath); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	os.MkdirAll(trashPath, 0755)
+	os.MkdirAll(trashPath, 0o755)
+	h.Hub.Notify("files")
 	h.writeJSON(w, map[string]string{"status": "ok"})
 }
 

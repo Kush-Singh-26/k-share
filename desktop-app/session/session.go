@@ -2,16 +2,18 @@ package session
 
 import (
 	"context"
+	"desktop-app/config"
+	"desktop-app/crypto"
+	"desktop-app/trustops"
+	"desktop-app/discoveryops"
 	"fmt"
 	"log"
 	"net"
 	"strings"
+	"sync"
+	"time"
 
 	"desktop-app/api"
-	"desktop-app/config"
-	"desktop-app/crypto"
-	"desktop-app/discoveryops"
-	"desktop-app/trustops"
 )
 
 var ErrTrustRequired = trustops.ErrTrustRequired
@@ -56,6 +58,7 @@ type Manager struct {
 	isGuest          bool
 	clipboardChannel string
 	lastImageHash    string
+	mu               sync.RWMutex
 }
 
 func New(serverIP, pairingCode string) *Manager {
@@ -84,20 +87,28 @@ func NewWithDependencies(apiClient APIClient, wsClient WSClient, trust TrustMana
 }
 
 func (m *Manager) APIClient() *api.Client {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	return m.apiConcrete
 }
 
 func (m *Manager) WSClient() *api.WSClient {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	return m.wsConcrete
 }
 
 func (m *Manager) SetServerIP(ip string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.serverIP = ip
 	m.apiClient.SetServerIP(ip)
 	m.wsClient.SetServerIP(ip)
 }
 
 func (m *Manager) SetPairingCode(code string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.pairingCode = code
 	m.apiClient.SetAuthCode(code)
 	m.wsClient.SetAuthCode(code)
@@ -106,26 +117,38 @@ func (m *Manager) SetPairingCode(code string) {
 }
 
 func (m *Manager) ServerIP() string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	return m.serverIP
 }
 
 func (m *Manager) PairingCode() string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	return m.pairingCode
 }
 
 func (m *Manager) IsGuest() bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	return m.isGuest
 }
 
 func (m *Manager) ClipboardChannel() string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	return m.clipboardChannel
 }
 
 func (m *Manager) LastImageHash() string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	return m.lastImageHash
 }
 
 func (m *Manager) SetLastImageHash(hash string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.lastImageHash = hash
 }
 
@@ -142,12 +165,23 @@ func (m *Manager) TrustPending() {
 }
 
 func (m *Manager) Connect() (string, error) {
-	role, err := m.apiClient.Ping(context.TODO())
-	if err != nil {
+	m.mu.RLock()
+	serverIP := m.serverIP
+	m.mu.RUnlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	role, err := m.apiClient.Ping(ctx)
+	if err != nil && !strings.Contains(err.Error(), crypto.ErrCertificateNotTrusted.Error()) {
 		return "", err
 	}
 
-	if err := m.trust.Check(m.serverIP, role); err != nil {
+	if trustErr := m.trust.Check(serverIP, role); trustErr != nil {
+		return "", trustErr
+	}
+
+	if err != nil {
 		return "", err
 	}
 
@@ -155,20 +189,26 @@ func (m *Manager) Connect() (string, error) {
 }
 
 func (m *Manager) CompleteConnection(role string) {
-	m.isGuest = role == "guest"
+	// Role comparison is case-insensitive
+	lowerRole := strings.ToLower(role)
+	
+	m.mu.Lock()
+	m.isGuest = (lowerRole == "guest")
 	if m.isGuest {
 		m.clipboardChannel = "guest"
 	} else {
 		m.clipboardChannel = ""
 	}
+	serverIP := m.serverIP
+	m.mu.Unlock()
 
 	if err := m.wsClient.Connect(); err != nil {
 		log.Printf("WebSocket connect failed: %v", err)
 	}
 
-	host, _, err := net.SplitHostPort(m.serverIP)
+	host, _, err := net.SplitHostPort(serverIP)
 	if err != nil {
-		host = m.serverIP
+		host = serverIP
 	}
 	if host != "" && host != "localhost" && host != "127.0.0.1" {
 		parts := strings.Split(host, ".")

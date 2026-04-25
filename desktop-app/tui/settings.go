@@ -8,6 +8,7 @@ import (
 	"desktop-app/session"
 	"fmt"
 	"strings"
+	"unicode"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -18,38 +19,88 @@ func (m *AppModel) updateSettingsView(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
-		switch msg.String() {
-		case "enter", "up", "down":
-			s := msg.String()
-			if s == "enter" && m.focusIndex == len(m.inputs)-1 {
-				// Save Settings
-				m.saveSettings()
-				return m, nil
-			}
+		key := msg.String()
 
-			// Cycle focus
-			if s == "up" {
-				m.focusIndex--
-			} else {
-				m.focusIndex++
-			}
-
-			if m.focusIndex > len(m.inputs)-1 {
-				m.focusIndex = 0
-			} else if m.focusIndex < 0 {
-				m.focusIndex = len(m.inputs) - 1
-			}
-
-			for i := 0; i <= len(m.inputs)-1; i++ {
-				if i == m.focusIndex {
-					cmds = append(cmds, m.inputs[i].Focus())
-					continue
+		// Handle manual word deletion for PowerShell compatibility
+		// (PowerShell often sends unexpected codes that aren't captured by Bubble's KeyMap)
+		if key == "ctrl+backspace" || key == "ctrl+h" || key == "alt+backspace" {
+			// Delete the word before the cursor (i.e. the last word if cursor is at end)
+			input := &m.inputs[m.focusIndex]
+			text := input.Value()
+			if len(text) > 0 {
+				runes := []rune(text)
+				// Find start of last word
+				i := len(runes) - 1
+				// Skip trailing spaces
+				for i >= 0 && unicode.IsSpace(runes[i]) {
+					i--
 				}
-				m.inputs[i].Blur()
+				if i >= 0 {
+					// Find end of previous word
+					wordEnd := i
+					for i >= 0 && !unicode.IsSpace(runes[i]) {
+						i--
+					}
+					wordStart := i + 1
+					// Delete the word
+					newText := string(runes[:wordStart]) + string(runes[wordEnd+1:])
+					input.SetValue(newText)
+				}
 			}
+			return m, tea.Batch(cmds...)
+		}
+		if key == "ctrl+delete" || key == "alt+delete" {
+			// Delete the word after the cursor
+			input := &m.inputs[m.focusIndex]
+			text := input.Value()
+			if len(text) > 0 {
+				runes := []rune(text)
+				// Skip current word
+				i := 0
+				for i < len(runes) && !unicode.IsSpace(runes[i]) {
+					i++
+				}
+				// Skip spaces
+				for i < len(runes) && unicode.IsSpace(runes[i]) {
+					i++
+				}
+				if i < len(runes) {
+					// Delete from start to next word
+					newText := string(runes[i:])
+					input.SetValue(newText)
+				}
+			}
+			return m, tea.Batch(cmds...)
 		}
 
-		// Update all inputs with key events
+		// Handle save shortcut first
+		if key == "enter" && m.focusIndex == len(m.inputs)-1 {
+			cmd := m.saveSettings()
+			return m, cmd
+		}
+
+		// Handle navigation shortcuts
+		if key == "up" {
+			m.focusIndex--
+		} else if key == "down" {
+			m.focusIndex++
+		}
+
+		if m.focusIndex > len(m.inputs)-1 {
+			m.focusIndex = 0
+		} else if m.focusIndex < 0 {
+			m.focusIndex = len(m.inputs) - 1
+		}
+
+		for i := 0; i <= len(m.inputs)-1; i++ {
+			if i == m.focusIndex {
+				cmds = append(cmds, m.inputs[i].Focus())
+				continue
+			}
+			m.inputs[i].Blur()
+		}
+
+		// Pass all keys to inputs for native handling (including ctrl+backspace, ctrl+delete, etc)
 		for i := range m.inputs {
 			var cmd tea.Cmd
 			m.inputs[i], cmd = m.inputs[i].Update(msg)
@@ -57,7 +108,7 @@ func (m *AppModel) updateSettingsView(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 	default:
-		// Non-key updates
+		// Non-key updates - pass to all inputs
 		for i := range m.inputs {
 			var cmd tea.Cmd
 			m.inputs[i], cmd = m.inputs[i].Update(msg)
@@ -68,46 +119,64 @@ func (m *AppModel) updateSettingsView(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, tea.Batch(cmds...)
 }
 
-func (m *AppModel) saveSettings() {
-	config.Current.ServerIP = m.inputs[0].Value()
-	config.Current.PairingCode = m.inputs[1].Value()
-	config.Current.DownloadFolder = m.inputs[2].Value()
+func (m *AppModel) saveSettings() tea.Cmd {
+	_ = config.SetServerIP(m.inputs[0].Value())
+	_ = config.SetPairingCode(m.inputs[1].Value())
+	_ = config.SetDownloadFolder(m.inputs[2].Value())
 
 	err := config.Save()
 	if err != nil {
 		m.statusMsg = fmt.Sprintf("%s Save failed: %v", IconError, err)
-	} else {
-		m.statusMsg = Branding.GetIcon(IconSuccess, "") + "Settings saved"
+		return nil
+	}
 
-		// Re-initialize session with new values
-		if m.session != nil {
-			m.session.Close()
-		}
-		m.session = session.New(config.Current.ServerIP, config.Current.PairingCode)
-		m.apiClient = m.session.APIClient()
-		m.wsClient = m.session.WSClient()
-		m.fileOps = fileops.New(m.apiClient, config.Current.DownloadFolder)
+	// Re-initialize session with new values
+	if m.session != nil {
+		m.session.Close()
+	}
+	cfg := config.Get()
+	m.session = session.New(cfg.ServerIP, cfg.PairingCode)
+	m.apiClient = m.session.APIClient()
+	m.wsClient = m.session.WSClient()
+	m.fileOps = fileops.New(m.apiClient, cfg.DownloadFolder)
 
-		// Re-initialize clipOps and historyOps with new apiClient
-		m.clipOps = clipboardops.New(m.apiClient)
-		m.historyOps = historyops.New(m.apiClient)
+	// Re-initialize clipOps and historyOps with new apiClient
+	m.clipOps = clipboardops.New(m.apiClient)
+	m.historyOps = historyops.New(m.apiClient)
 
-		// Re-register WebSocket Callbacks (Issue #5)
-		m.wsClient.OnHistoryUpdate = func() {
+	// Re-register WebSocket Callbacks with nil checks
+	m.wsClient.SetOnHistoryUpdate(func() {
+		if m.program != nil {
 			m.program.Send(wsHistoryUpdateMsg{})
 		}
-		m.wsClient.OnFilesUpdate = func() {
+	})
+	m.wsClient.SetOnFilesUpdate(func() {
+		if m.program != nil {
 			m.program.Send(wsFilesUpdateMsg{})
 		}
-		m.wsClient.OnClipUpdate = func() {
+	})
+	m.wsClient.SetOnClipUpdate(func() {
+		if m.program != nil {
 			m.program.Send(wsClipUpdateMsg{})
 		}
-		m.wsClient.OnStatusChange = func(status string) {
+	})
+	m.wsClient.SetOnClipGuestUpdate(func() {
+		if m.program != nil {
+			m.program.Send(wsClipGuestUpdateMsg{})
+		}
+	})
+	m.wsClient.SetOnStatusChange(func(status string) {
+		if m.program != nil {
 			m.program.Send(wsStatusMsg{status: status})
 		}
+	})
 
-		// Reconnect WS
-		go m.wsClient.Connect()
+	m.statusMsg = Branding.GetIcon(IconLoading, "") + "Reconnecting..."
+
+	// Return sessionReconnectedMsg to signal that the session was changed
+	// The Update loop will handle refreshing the data with new session
+	return func() tea.Msg {
+		return sessionReconnectedMsg{}
 	}
 }
 
@@ -143,9 +212,9 @@ func (m *AppModel) renderSettings() string {
 	
 	dashboardContent := lipgloss.JoinVertical(lipgloss.Left,
 		HeaderStyle.Render("Session Dashboard"),
-		fmt.Sprintf("Role: %s", roleStr),
-		fmt.Sprintf("Uptime: Active"),
-		fmt.Sprintf("Status: %s", m.statusMsg),
+		"Role: " + roleStr,
+		"Uptime: Active",
+		"Status: " + m.statusMsg,
 		"",
 		DimTextStyle.Render("Changes will reconnect"),
 		DimTextStyle.Render("session automatically."),
@@ -163,8 +232,6 @@ func (m *AppModel) renderSettings() string {
 	
 	return lipgloss.JoinVertical(
 		lipgloss.Center,
-		RenderLogo(totalContentWidth),
-		"\n",
 		splitView,
 		hint,
 	)

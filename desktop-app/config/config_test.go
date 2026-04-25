@@ -11,21 +11,28 @@ func resetConfigForTest(t *testing.T) string {
 	t.Helper()
 
 	oldPath := configPath
-	oldCurrent := Current
+	mu.Lock()
+	oldCurrent := current
+	mu.Unlock()
 
 	dir := t.TempDir()
 	configPath = filepath.Join(dir, "settings.json")
-	Current = &Config{
+	
+	mu.Lock()
+	current = &Config{
 		ServerIP:          "localhost:9823",
 		DownloadFolder:    ".",
 		AutoSyncClipboard: true,
 		SavedNetworks:     make(map[string]string),
 		KnownServers:      make(map[string]ServerIdentity),
 	}
+	mu.Unlock()
 
 	t.Cleanup(func() {
 		configPath = oldPath
-		Current = oldCurrent
+		mu.Lock()
+		current = oldCurrent
+		mu.Unlock()
 	})
 
 	return configPath
@@ -56,8 +63,10 @@ func TestLoadFromPathAppliesDefaults(t *testing.T) {
 func TestKnownServerPersistence(t *testing.T) {
 	path := resetConfigForTest(t)
 
-	Current.KnownServers = nil
-	Current.SavedNetworks = nil
+	mu.Lock()
+	current.KnownServers = nil
+	current.SavedNetworks = nil
+	mu.Unlock()
 
 	identity := ServerIdentity{
 		CertHash:    "abc123",

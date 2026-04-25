@@ -4,6 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>K-Share Admin Dashboard</title>
+    <link rel="icon" type="image/png" href="/dashboard/favicon.png">
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
@@ -195,15 +196,42 @@
 
         .log-panel {
             background: #000;
-            color: #2ecc71;
+            color: #d1d1d1;
             font-family: 'JetBrains Mono', monospace;
             font-size: 0.8125rem;
             padding: 1rem;
             border-radius: 4px;
-            height: 400px;
+            height: 500px;
             overflow-y: auto;
             border: 1px solid var(--border);
-            line-height: 1.5;
+            line-height: 1.6;
+            white-space: pre-wrap;
+        }
+
+        .log-line {
+            padding: 2px 0;
+            border-bottom: 1px solid #1a1a1a;
+        }
+
+        .log-error { color: #e74c3c; }
+        .log-success { color: #2ecc71; }
+        .log-warn { color: #f1c40f; }
+        .log-info { color: #3498db; }
+        .log-meta { color: #555; font-size: 0.75rem; margin-right: 0.5rem; }
+
+        .action-btn {
+            background: none;
+            border: none;
+            color: var(--text-muted);
+            cursor: pointer;
+            padding: 4px;
+            border-radius: 4px;
+            transition: all 0.2s;
+        }
+
+        .action-btn:hover {
+            color: var(--danger);
+            background: rgba(231, 76, 60, 0.1);
         }
 
         /* Hidden Utility */
@@ -335,6 +363,7 @@
                             <th>NAME</th>
                             <th>SIZE</th>
                             <th>LAST MODIFIED</th>
+                            <th style="text-align: right">ACTIONS</th>
                         </tr>
                     </thead>
                     <tbody id="files-body">
@@ -355,29 +384,59 @@
 
     <script>
         let adminCode = sessionStorage.getItem('k-share-token');
+        let globalConfig = null;
+        let ws = null;
+        let currentSection = 'overview';
 
         function login() {
             const input = document.getElementById('admin-code-input');
-            adminCode = input.value;
-            // Verify by attempting a status fetch
+            adminCode = input.value || adminCode;
+            if (!adminCode) return;
+
             fetchData('/api/admin/status').then(data => {
                 if (data) {
                     sessionStorage.setItem('k-share-token', adminCode);
                     document.getElementById('login-screen').classList.add('hidden');
                     document.getElementById('sidebar').classList.remove('hidden');
                     document.getElementById('content').classList.remove('hidden');
-                    startPolling();
+                    connectWS();
+                    updateUI('overview');
                 } else {
                     alert('Invalid Administrator Code');
+                    sessionStorage.removeItem('k-share-token');
                 }
             });
         }
 
+        function connectWS() {
+            if (ws) ws.close();
+            const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+            ws = new WebSocket(`${proto}//${location.host}/ws?token=${adminCode}`);
+            
+            ws.onmessage = (event) => {
+                const msg = JSON.parse(event.data);
+                console.log('WS Notification:', msg.type);
+                
+                // Reactive updates based on event type
+                if (msg.type === 'files') {
+                    if (currentSection === 'files') updateUI('files');
+                    updateUI('overview');
+                }
+                if (msg.type === 'clip' || msg.type === 'history' || msg.type === 'ip_change') {
+                    updateUI('overview');
+                }
+                
+                // Always refresh logs if viewing
+                if (currentSection === 'logs') updateUI('logs');
+            };
+
+            ws.onclose = () => setTimeout(connectWS, 3000);
+            ws.onerror = (e) => console.error('WS Error:', e);
+        }
+
         async function fetchData(url, options = {}) {
             const defaultOptions = {
-                headers: {
-                    'Authorization': `Bearer ${adminCode}`
-                }
+                headers: { 'Authorization': `Bearer ${adminCode}` }
             };
             try {
                 const response = await fetch(url, { ...defaultOptions, ...options });
@@ -398,77 +457,126 @@
         }
 
         function showSection(id) {
+            currentSection = id;
             document.querySelectorAll('.view').forEach(v => v.classList.add('hidden'));
             document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
             document.getElementById(`section-${id}`).classList.remove('hidden');
-            event.target.classList.add('active');
+            
+            // Highlight active nav item
+            const navItems = Array.from(document.querySelectorAll('.nav-item'));
+            const activeNav = navItems.find(n => n.textContent.toLowerCase().includes(id));
+            if (activeNav) activeNav.classList.add('active');
+            
             updateUI(id);
         }
 
-        function startPolling() {
-            updateUI('overview');
-            setInterval(() => {
-                if (!document.getElementById('section-overview').classList.contains('hidden')) updateUI('overview');
-                if (!document.getElementById('section-logs').classList.contains('hidden')) updateUI('logs');
-            }, 5000);
+        function escapeHTML(str) {
+            const div = document.createElement('div');
+            div.textContent = str;
+            return div.innerHTML;
+        }
+
+        function parseLogLine(line) {
+            if (!line.trim()) return '';
+            
+            let typeClass = '';
+            if (line.includes('❌') || line.includes('error') || line.includes('failed')) typeClass = 'log-error';
+            else if (line.includes('⚠️') || line.includes('Warning')) typeClass = 'log-warn';
+            else if (line.includes('✅') || line.includes('success')) typeClass = 'log-success';
+            else if (line.includes('📡') || line.includes('🚀') || line.includes('🔄')) typeClass = 'log-info';
+
+            // Extract timestamp if it looks like "2026/04/25 12:34:56"
+            const tsMatch = line.match(/^(\d{4}\/\d{2}\/\d{2}\s\d{2}:\d{2}:\d{2})\s/);
+            let timestamp = '';
+            let content = line;
+
+            if (tsMatch) {
+                timestamp = `<span class="log-meta">${tsMatch[1]}</span>`;
+                content = line.substring(tsMatch[0].length);
+            }
+
+            return `<div class="log-line ${typeClass}">${timestamp}${escapeHTML(content)}</div>`;
         }
 
         async function updateUI(section) {
             if (section === 'overview') {
                 const status = await fetchData('/api/admin/status');
                 if (status) {
-                    document.getElementById('stat-connections').innerText = status.clientCount;
-                    document.getElementById('stat-endpoint').innerText = `https://${location.hostname}:${status.port}`;
-                    document.getElementById('stat-storage').innerText = status.sharedDir;
+                    document.getElementById('stat-connections').textContent = status.clientCount;
+                    document.getElementById('stat-endpoint').textContent = `https://${location.hostname}:${status.port}`;
+                    document.getElementById('stat-storage').textContent = status.sharedDir;
                 }
             }
             if (section === 'config') {
-                const cfg = await fetchData('/api/admin/config');
-                if (cfg) {
-                    document.getElementById('config-port').value = cfg.port;
-                    document.getElementById('config-dir').value = cfg.shared_dir;
+                globalConfig = await fetchData('/api/admin/config');
+                if (globalConfig) {
+                    document.getElementById('config-port').value = globalConfig.port;
+                    document.getElementById('config-dir').value = globalConfig.shared_dir;
                 }
             }
             if (section === 'logs') {
                 const lines = await fetchData('/api/admin/logs');
                 if (lines) {
-                    document.getElementById('log-content').innerText = lines.join('\n');
-                    const el = document.getElementById('log-content');
-                    el.scrollTop = el.scrollHeight;
+                    const logEl = document.getElementById('log-content');
+                    logEl.innerHTML = lines.filter(l => l.trim()).map(parseLogLine).join('');
+                    logEl.scrollTop = logEl.scrollHeight;
                 }
             }
             if (section === 'files') {
                 const files = await fetchData('/api/admin/files');
                 if (files) {
                     const body = document.getElementById('files-body');
-                    body.innerHTML = files.map(f => `
-                        <tr>
-                            <td>${f.name}${f.dir ? '/' : ''}</td>
-                            <td>${f.dir ? '-' : formatSize(f.size)}</td>
-                            <td>${new Date(f.mtime).toLocaleString()}</td>
-                        </tr>
-                    `).join('');
+                    body.innerHTML = '';
+                    files.forEach(f => {
+                        const tr = document.createElement('tr');
+                        const isDir = f.dir;
+                        tr.innerHTML = `
+                            <td style="font-weight: 500">${escapeHTML(f.name)}${isDir ? '/' : ''}</td>
+                            <td style="color: var(--text-secondary)">${isDir ? '-' : formatSize(f.size)}</td>
+                            <td style="color: var(--text-secondary)">${new Date(f.mtime).toLocaleString()}</td>
+                            <td style="text-align: right">
+                                <button class="action-btn" title="Delete" onclick="deleteFile('${f.name}')">
+                                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h18M19 6v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6m3 0V4a2 2 0 012-2h4a2 2 0 012 2v2M10 11v6M14 11v6"/></svg>
+                                </button>
+                            </td>
+                        `;
+                        body.appendChild(tr);
+                    });
                 }
             }
         }
 
+        async function deleteFile(path) {
+            if (!confirm(`Move "${path}" to trash?`)) return;
+            const res = await fetchData(`/delete?path=${encodeURIComponent(path)}`, { method: 'POST' });
+            if (res !== null) {
+                // UI will refresh via WS notification
+            }
+        }
+
         async function revealCodes() {
-            const cfg = await fetchData('/api/admin/config');
-            if (cfg) {
-                document.getElementById('code-admin').innerText = cfg.admin_code;
-                document.getElementById('code-guest').innerText = cfg.guest_code;
+            globalConfig = await fetchData('/api/admin/config');
+            if (globalConfig) {
+                document.getElementById('code-admin').innerText = globalConfig.admin_code;
+                document.getElementById('code-guest').innerText = globalConfig.guest_code;
             }
         }
 
         async function rotateCodes() {
             if (confirm('Regenerate all access codes? Existing sessions will be terminated.')) {
-                await fetchData('/api/admin/rotate-codes');
+                await fetchData('/api/admin/rotate-codes', { method: 'POST' });
                 revealCodes();
             }
         }
 
         async function saveConfig() {
+            if (!globalConfig) {
+                globalConfig = await fetchData('/api/admin/config');
+            }
+            if (!globalConfig) return;
+
             const payload = {
+                ...globalConfig,
                 port: document.getElementById('config-port').value,
                 shared_dir: document.getElementById('config-dir').value
             };
@@ -477,6 +585,13 @@
                 body: JSON.stringify(payload)
             });
             if (res) alert('Config saved. Restart server to apply changes.');
+        }
+
+        async function clearTrash() {
+            if (confirm('Permanently delete all files in trash?')) {
+                const res = await fetchData('/api/admin/clear-trash', { method: 'POST' });
+                if (res) alert('Trash cleared');
+            }
         }
 
         function formatSize(bytes) {

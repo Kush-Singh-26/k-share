@@ -1,3 +1,8 @@
+[![Build and Release](https://github.com/Kush-Singh-26/k-share/actions/workflows/build.yml/badge.svg)](https://github.com/Kush-Singh-26/k-share/actions/workflows/build.yml)
+[![Go Version](https://img.shields.io/badge/Go-1.26-blue)](https://go.dev)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Platforms](https://img.shields.io/badge/platforms-Windows%20%7C%20macOS%20%7C%20Linux-orange)](https://github.com/Kush-Singh-26/k-share/releases)
+
 # K-Share
 
 K-Share is a local-network file and clipboard sharing system with three products:
@@ -54,6 +59,25 @@ go build -tags tui -trimpath -ldflags="-s -w" -o k-share-tui.exe main_tui.go
 ```
 The TUI is built using [Bubbletea](https://github.com/charmbracelet/bubbletea) and excludes all GUI dependencies for a lightweight, fast binary.
 
+### Automated Builds via GitHub Actions
+
+Binaries for Windows, macOS, and Linux are automatically built and released when a new git tag is pushed:
+
+```powershell
+# Create a new version tag and push
+git tag v1.0.0
+git push origin v1.0.0
+```
+
+This triggers the [Build and Release](https://github.com/Kush-Singh-26/k-share/actions/workflows/build.yml) workflow which:
+
+- Builds the server for all platforms
+- Builds the TUI for all platforms
+- Builds the desktop GUI for all platforms
+- Creates a GitHub Release with all binaries
+
+Pre-built binaries are available on the [Releases](https://github.com/Kush-Singh-26/k-share/releases) page.
+
 ### Android app
 
 Open [`android-app`](./android-app) in Android Studio and build the `app` module normally.
@@ -103,3 +127,12 @@ The desktop app stores its settings in the OS user config directory under `K-Sha
 ## License
 
 MIT. See [`LICENSE`](./LICENSE).
+
+## Related Documentation
+
+- [Contributing](./CONTRIBUTING.md) - Developer guidelines
+- [Security](./SECURITY.md) - Security policy
+- [Changelog](./CHANGELOG.md) - Release history
+- [Build and Package](./docs/release/build-and-package.md) - Detailed build instructions
+- [Architecture](./docs/architecture/system-overview.md) - System design
+- [HTTP API](./docs/protocol/http-api.md) - API reference

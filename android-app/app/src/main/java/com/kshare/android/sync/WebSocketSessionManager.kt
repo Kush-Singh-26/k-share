@@ -33,10 +33,14 @@ class WebSocketSessionManager(
         fun onFailure(t: Throwable) {}
     }
 
+    private var currentDelay = 2000L
+    private val maxDelay = 64000L
+
     private data class Endpoint(
         val serverIp: String,
         val port: Int,
-        val path: String
+        val path: String,
+        val authCode: String
     )
 
     private val generationCounter = AtomicLong(0L)
@@ -48,8 +52,8 @@ class WebSocketSessionManager(
     private var webSocket: WebSocket? = null
     private var onReconnect: (suspend () -> Unit)? = null
 
-    fun connect(serverIp: String, port: Int, path: String = "/ws", listener: Listener, onReconnect: (suspend () -> Unit)? = null) {
-        this.endpoint = Endpoint(serverIp, port, path)
+    fun connect(serverIp: String, port: Int, path: String = "/ws", authCode: String, listener: Listener, onReconnect: (suspend () -> Unit)? = null) {
+        this.endpoint = Endpoint(serverIp, port, path, authCode)
         this.listener = listener
         this.onReconnect = onReconnect
         reconnectJob?.cancel()
@@ -83,10 +87,12 @@ class WebSocketSessionManager(
         currentGeneration = generation
         val request = Request.Builder()
             .url("wss://${ep.serverIp}:${ep.port}${ep.path}")
+            .header("Authorization", "Bearer ${ep.authCode}")
             .build()
 
         webSocket = engine.newWebSocket(request, object : WebSocketListener() {
             override fun onOpen(webSocket: WebSocket, response: Response) {
+                currentDelay = 2000L // Reset backoff on success
                 targetListener.onOpen()
             }
 
@@ -114,7 +120,8 @@ class WebSocketSessionManager(
         val reconnect = onReconnect ?: return
         reconnectJob?.cancel()
         reconnectJob = scope.launch {
-            delay(reconnectDelayMs)
+            delay(currentDelay)
+            currentDelay = (currentDelay * 2).coerceAtMost(maxDelay)
             reconnect()
         }
     }

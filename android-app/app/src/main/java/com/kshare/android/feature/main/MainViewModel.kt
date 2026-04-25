@@ -72,10 +72,17 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         updateState { copy(serverIp = ip) }
     }
 
+    private var connectJob: Job? = null
+
     fun setServerPort(port: String) {
         settings.serverPort = port
         updateState { copy(serverPort = port) }
-        connectWebSocket()
+
+        connectJob?.cancel()
+        connectJob = viewModelScope.launch {
+            delay(1000) // 1s debounce
+            connectWebSocket()
+        }
     }
 
     fun setClipboardText(text: String) {
@@ -112,7 +119,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
         updateState { copy(isRefreshing = true) }
         viewModelScope.launch {
-            val files = ApiClient.listFiles(ip, port, settings.pairingCode)
+            val files = ApiClient.listFiles(ip, port, settings.pairingCode, uiState.value.currentPath)
             updateState {
                 copy(
                     fileList = files,
@@ -121,6 +128,37 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 )
             }
         }
+    }
+    
+    fun navigateToFolder(folderName: String) {
+        val current = uiState.value.currentPath
+        val folderToUse = if (folderName.startsWith("$current/")) {
+            folderName.removePrefix("$current/")
+        } else {
+            folderName
+        }
+        val newPath = if (current.isEmpty()) folderToUse else "$current/$folderToUse"
+        updateState { copy(currentPath = newPath) }
+        refreshFiles()
+    }
+    
+    fun navigateToPath(path: String) {
+        updateState { copy(currentPath = path) }
+        refreshFiles()
+    }
+    
+    fun navigateUp(): Boolean {
+        val current = uiState.value.currentPath
+        if (current.isEmpty()) return false
+        val parent = current.substringBeforeLast("/", "")
+        updateState { copy(currentPath = parent) }
+        refreshFiles()
+        return true
+    }
+    
+    fun navigateToRoot() {
+        updateState { copy(currentPath = "") }
+        refreshFiles()
     }
     
     fun setSearchQuery(query: String) {
@@ -207,8 +245,16 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             return
         }
 
+        val currentPath = uiState.value.currentPath
+        val fileNameToUse = if (file.name.startsWith("$currentPath/")) {
+            file.name.removePrefix("$currentPath/")
+        } else {
+            file.name
+        }
+        val fullPath = if (currentPath.isEmpty()) fileNameToUse else "$currentPath/$fileNameToUse"
+
         viewModelScope.launch {
-            val success = ApiClient.deleteFile(ip, port, file.name, settings.pairingCode)
+            val success = ApiClient.deleteFile(ip, port, fullPath, settings.pairingCode)
             if (success) {
                 Toast.makeText(appContext, "Deleted", Toast.LENGTH_SHORT).show()
                 refreshFiles()
@@ -223,12 +269,19 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val ip = uiState.value.serverIp
         val port = currentPort()
         if (ip.isEmpty()) return
+        val currentPath = uiState.value.currentPath
+        val fileNameToUse = if (file.name.startsWith("$currentPath/")) {
+            file.name.removePrefix("$currentPath/")
+        } else {
+            file.name
+        }
+        val fullPath = if (currentPath.isEmpty()) fileNameToUse else "$currentPath/$fileNameToUse"
         TransferLauncher.download(
             context = appContext,
             serverIp = ip,
             serverPort = port,
             pairingCode = settings.pairingCode,
-            fileName = file.name,
+            fileName = fullPath,
             isDir = file.isDir
         )
     }
@@ -282,7 +335,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         when (val outcome = connectionCoordinator.trustPendingServer(
             state.pendingTrustIp,
             state.pendingTrustPort,
-            state.pendingTrustHash
+            state.pendingTrustHash,
+            state.pendingTrustIsGuest
         )) {
             is ConnectionOutcome.Connected -> applyConnectedOutcome(outcome)
             else -> Unit
@@ -347,7 +401,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val port = currentPort()
         if (ip.isEmpty()) return
 
-        webSocketManager.connect(ip, port, listener = object : WebSocketSessionManager.Listener {
+        webSocketManager.connect(ip, port, authCode = settings.pairingCode, listener = object : WebSocketSessionManager.Listener {
             override fun onOpen() {
                 updateState { copy(statusColor = GREEN) }
             }
@@ -449,7 +503,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 showTrustDialog = true,
                 pendingTrustIp = outcome.ip,
                 pendingTrustHash = outcome.certHash,
-                pendingTrustPort = outcome.port
+                pendingTrustPort = outcome.port,
+                pendingTrustIsGuest = outcome.isGuest
             )
         }
     }

@@ -49,12 +49,20 @@ func (s *Service) SystemImageHash(data []byte) string {
 }
 
 func (s *Service) UploadScreenshot(ctx context.Context, data []byte) (string, error) {
+	return s.UploadScreenshotWithPrefix(ctx, data, "")
+}
+
+func (s *Service) UploadScreenshotWithPrefix(ctx context.Context, data []byte, prefix string) (string, error) {
 	timestamp := time.Now().Format("2006-01-02_15-04-05")
 	filename := "screenshot_" + timestamp + ".png"
-	if err := s.client.UploadFile(ctx, filename, bytes.NewReader(data)); err != nil {
+	uploadPath := filename
+	if prefix != "" {
+		uploadPath = prefix + "/" + filename
+	}
+	if err := s.client.UploadFile(ctx, uploadPath, bytes.NewReader(data)); err != nil {
 		return "", err
 	}
-	return filename, nil
+	return uploadPath, nil
 }
 
 func (s *Service) ReadSystemImageClipboard() []byte {

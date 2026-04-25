@@ -3,7 +3,9 @@ package realtime
 import (
 	"encoding/json"
 	"log"
+	"net"
 	"net/http"
+	"net/url"
 	"sync"
 	"time"
 
@@ -63,7 +65,7 @@ func (c *client) readPump() {
 	for {
 		_, _, err := c.conn.ReadMessage()
 		if err != nil {
-			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
+			if websocket.IsUnexpectedCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
 				log.Printf("WebSocket error: %v", err)
 			}
 			break
@@ -77,6 +79,7 @@ type Hub struct {
 	register   chan *client
 	unregister chan *client
 	mutex      sync.RWMutex
+	NotifyCh   chan string
 }
 
 func NewHub() *Hub {
@@ -85,6 +88,7 @@ func NewHub() *Hub {
 		broadcast:  make(chan []byte, 256),
 		register:   make(chan *client),
 		unregister: make(chan *client),
+		NotifyCh:   make(chan string, 10),
 	}
 }
 
@@ -103,17 +107,16 @@ func (h *Hub) Run() {
 			}
 			h.mutex.Unlock()
 		case message := <-h.broadcast:
-			h.mutex.RLock()
+			h.mutex.Lock()
 			for client := range h.clients {
 				select {
 				case client.send <- message:
 				default:
-					// Client send channel is full; close it
 					close(client.send)
 					delete(h.clients, client)
 				}
 			}
-			h.mutex.RUnlock()
+			h.mutex.Unlock()
 		}
 	}
 }
@@ -125,10 +128,30 @@ func (h *Hub) Notify(changeType string) {
 	default:
 		// Broadcast channel is full; drop the message
 	}
+	// Internal Notify
+	select {
+	case h.NotifyCh <- changeType:
+	default:
+	}
 }
 
 var Upgrader = websocket.Upgrader{
-	CheckOrigin: func(r *http.Request) bool { return true },
+	CheckOrigin: func(r *http.Request) bool {
+		// Allow if origin is same host or localhost
+		origin := r.Header.Get("Origin")
+		if origin == "" {
+			return true
+		}
+		u, err := url.Parse(origin)
+		if err != nil {
+			return false
+		}
+		host, _, _ := net.SplitHostPort(r.Host)
+		if host == "" {
+			host = r.Host
+		}
+		return u.Hostname() == "localhost" || u.Hostname() == "127.0.0.1" || u.Hostname() == host
+	},
 }
 
 func (h *Hub) HandleWS(w http.ResponseWriter, r *http.Request) {

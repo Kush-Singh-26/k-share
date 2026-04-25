@@ -28,7 +28,7 @@ data class LinkAddressInfo(val ip: String, val prefixLength: Int)
 object NetworkScanner {
 
     private const val WORKER_COUNT = 60
-    private const val CONNECT_TIMEOUT_MS = 500
+    private const val CONNECT_TIMEOUT_MS = 400
 
     // ==================== 1. CONNECTIVITY GATEKEEPER ====================
 
@@ -73,15 +73,13 @@ object NetworkScanner {
 
     fun getLinkAddressInfo(context: Context): LinkAddressInfo? {
         // PRIORITY 1: Check for hotspot/tethering interfaces first
-        // These have names like "ap0", "wlan1", "rndis0", "swlan0"
         try {
             val hotspotInfo = NetworkInterface.getNetworkInterfaces()?.asSequence()?.mapNotNull { iface ->
                 val name = iface.name.lowercase()
-                // Hotspot interface names vary by manufacturer
                 val isHotspotInterface = name.startsWith("ap") || 
                                          name.startsWith("swlan") ||
                                          name.startsWith("rndis") ||
-                                         (name.startsWith("wlan") && name != "wlan0") // wlan1, wlan2 are often hotspot
+                                         (name.startsWith("wlan") && name != "wlan0")
                 
                 if (isHotspotInterface && iface.isUp) {
                     iface.interfaceAddresses.firstOrNull { 
@@ -93,9 +91,9 @@ object NetworkScanner {
             }?.firstOrNull()
             
             if (hotspotInfo != null) return hotspotInfo
-        } catch (e: Exception) { /* continue to fallback */ }
+        } catch (e: Exception) { }
 
-        // PRIORITY 2: Check wlan0 (standard WiFi) 
+        // PRIORITY 2: Check wlan0
         try {
             val wlanInfo = NetworkInterface.getNetworkInterfaces()?.asSequence()?.mapNotNull { iface ->
                 val name = iface.name.lowercase()
@@ -109,9 +107,9 @@ object NetworkScanner {
             }?.firstOrNull()
             
             if (wlanInfo != null) return wlanInfo
-        } catch (e: Exception) { /* continue to fallback */ }
+        } catch (e: Exception) { }
 
-        // PRIORITY 3: ConnectivityManager (may return mobile data in hotspot mode)
+        // PRIORITY 3: ConnectivityManager
         val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
         val activeNetwork = cm.activeNetwork
         val linkProps = activeNetwork?.let { cm.getLinkProperties(it) }
@@ -120,11 +118,9 @@ object NetworkScanner {
             for (linkAddr in linkProps.linkAddresses) {
                 val addr = linkAddr.address
                 if (addr is Inet4Address && !addr.isLoopbackAddress) {
-                    // Skip carrier-grade NAT IPs (100.64.0.0/10)
                     val firstOctet = addr.address[0].toInt() and 0xFF
                     val secondOctet = addr.address[1].toInt() and 0xFF
                     if (firstOctet == 100 && secondOctet in 64..127) continue
-                    
                     return LinkAddressInfo(addr.hostAddress ?: continue, linkAddr.prefixLength)
                 }
             }
@@ -136,12 +132,10 @@ object NetworkScanner {
     // ==================== 3. QUICK PING ====================
 
     private fun getFastClient(timeoutMs: Long): OkHttpClient {
-        // Use ApiClient's insecure client for discovery/ping. This allows TOFU certificate capture.
-        return ApiClient.getInsecureClient(timeoutMs)
+        return ApiClient.getDiscoveryClient(timeoutMs)
     }
 
     suspend fun quickPing(ip: String, port: Int, pairingCode: String): Boolean {
-        // We ignore pairingCode for discovery ping (it's unauthenticated now)
         return ApiClient.ping(ip, port).success
     }
 
@@ -169,19 +163,15 @@ object NetworkScanner {
         fun cleanup() {
             try {
                 discoveryListener?.let { nsdManager.stopServiceDiscovery(it) }
-            } catch (e: Exception) {
-            }
+            } catch (e: Exception) { }
             try {
                 if (multicastLock.isHeld) multicastLock.release()
-            } catch (e: Exception) {
-            }
+            } catch (e: Exception) { }
         }
 
-        onStatus("mDNS: Scanning for local server...")
+        onStatus("mDNS: Scanning...")
 
-        cont.invokeOnCancellation {
-            cleanup()
-        }
+        cont.invokeOnCancellation { cleanup() }
 
         discoveryListener = object : NsdManager.DiscoveryListener {
             override fun onDiscoveryStarted(regType: String) {}
@@ -214,8 +204,6 @@ object NetworkScanner {
 
         try {
             nsdManager.discoverServices(serviceType, NsdManager.PROTOCOL_DNS_SD, discoveryListener)
-            
-            // Timeout after 2.5 seconds
             val timeoutJob = CoroutineScope(cont.context).launch {
                 delay(2500)
                 if (!resolved) {
@@ -224,11 +212,7 @@ object NetworkScanner {
                     if (cont.isActive) cont.resume(null)
                 }
             }
-
-            cont.invokeOnCancellation {
-                timeoutJob.cancel()
-                cleanup()
-            }
+            cont.invokeOnCancellation { timeoutJob.cancel(); cleanup() }
         } catch (e: Exception) {
             cleanup()
             if (cont.isActive) cont.resume(null)
@@ -241,156 +225,102 @@ object NetworkScanner {
         pairingCode: String,
         onStatus: (String) -> Unit
     ): String? = withContext(Dispatchers.IO) {
-        
-        val linkInfo = getLinkAddressInfo(context)
-        if (linkInfo == null) {
-            onStatus("No network")
-            return@withContext null
-        }
-
+        val linkInfo = getLinkAddressInfo(context) ?: return@withContext null
         val parts = linkInfo.ip.split(".").map { it.toInt() }
-        if (parts.size != 4) {
-            onStatus("Invalid IP")
-            return@withContext null
-        }
+        if (parts.size != 4) return@withContext null
 
         val myThirdOctet = parts[2]
         val basePrefix = "${parts[0]}.${parts[1]}"
         val scannedBlocks = mutableSetOf<Int>()
 
-        // Try mDNS first
         val mdnsResult = tryMdnsDiscovery(context, port, pairingCode, onStatus)
         if (mdnsResult != null) return@withContext mdnsResult
 
-        // Helper to scan a set of blocks
         suspend fun scanTargetBlocks(blocks: Iterable<Int>, zoneLabel: String): String? {
-            // Strict safety: 0..255 check and deduplication
             val targets = blocks.filter { it in 0..255 && !scannedBlocks.contains(it) }.distinct()
             if (targets.isEmpty()) return null
-            
             scannedBlocks.addAll(targets)
             
-            // UX: Show range being scanned
             val min = targets.minOrNull() ?: 0
             val max = targets.maxOrNull() ?: 0
-            val rangeStr = if (min == max) "$min" else "$min-$max"
-            onStatus("$zoneLabel: $basePrefix.[$rangeStr].*")
+            onStatus("$zoneLabel: $basePrefix.[${if (min == max) "$min" else "$min-$max"}].*")
 
-            val ips = targets.flatMap { block ->
-                (1..254).map { host -> "$basePrefix.$block.$host" }
-            }
-
+            val ips = targets.flatMap { block -> (1..254).map { host -> "$basePrefix.$block.$host" } }
             return scanZone(ips, port, pairingCode)
         }
 
-        // Zone 1: Own /24 block (Exact Match)
-        var result = scanTargetBlocks(listOf(myThirdOctet), "Zone 1 (Local)")
-        if (result != null) return@withContext result
+        scanTargetBlocks(listOf(myThirdOctet), "Zone 1 (Local)")?.let { return@withContext it }
+        scanTargetBlocks((myThirdOctet - 2)..(myThirdOctet + 2), "Zone 2 (Neighbors)")?.let { return@withContext it }
+        scanTargetBlocks((myThirdOctet - 10)..(myThirdOctet + 10), "Zone 3 (Deep)")?.let { return@withContext it }
+        scanTargetBlocks((myThirdOctet - 30)..(myThirdOctet + 30), "Zone 4 (Wide)")?.let { return@withContext it }
+        scanTargetBlocks(listOf(0, 1, 2), "Zone 5 (Roots)")?.let { return@withContext it }
 
-        // Zone 2: ±2 blocks (Neighbors)
-        result = scanTargetBlocks((myThirdOctet - 2)..(myThirdOctet + 2), "Zone 2 (Neighbors)")
-        if (result != null) return@withContext result
-
-        // Zone 3: ±10 blocks (Deep)
-        result = scanTargetBlocks((myThirdOctet - 10)..(myThirdOctet + 10), "Zone 3 (Deep)")
-        if (result != null) return@withContext result
-
-        // Zone 4: ±30 blocks (Wide) - Catches 0 vs 11 cases
-        result = scanTargetBlocks((myThirdOctet - 30)..(myThirdOctet + 30), "Zone 4 (Wide)")
-        if (result != null) return@withContext result
-
-        // Zone 5: Common Roots (0, 1, 2)
-        result = scanTargetBlocks(listOf(0, 1, 2), "Zone 5 (Roots)")
-        if (result != null) return@withContext result
-
-        // Zone 6: Full Subnet Scan (if /16 to /23)
-        // Ensure we don't scan impossibly large ranges (skip if < /16)
         val prefix = linkInfo.prefixLength
         if (prefix in 16..23) {
-             val size = 1 shl (24 - prefix) // Number of /24 blocks
-             // Calculate start of the block range for the 3rd octet
-             // e.g. /20 covers 16 blocks. mask = ~15.
+             val size = 1 shl (24 - prefix)
              val startBlock = myThirdOctet and (size - 1).inv()
              val endBlock = startBlock + size - 1
-             
-             result = scanTargetBlocks(startBlock..endBlock, "Zone 6 (Full Subnet)")
-             if (result != null) return@withContext result
+             scanTargetBlocks(startBlock..endBlock, "Zone 6 (Full Subnet)")?.let { return@withContext it }
         }
 
-        onStatus("Server not found")
+        onStatus("Not found")
         null
     }
 
-    /**
-     * Scans a zone of IPs using a bounded channel with 60 worker coroutines
-     */
     private suspend fun scanZone(
         ips: List<String>,
         port: Int,
         pairingCode: String
-    ): String? = coroutineScope {
-        if (ips.isEmpty()) return@coroutineScope null
+    ): String? = supervisorScope {
+        if (ips.isEmpty()) return@supervisorScope null
 
-        val channel = Channel<String>(capacity = Channel.BUFFERED)
+        val channel = Channel<String>(capacity = 100)
         val found = AtomicReference<String?>(null)
-        val cancelled = AtomicBoolean(false)
-
         val scanClient = getFastClient(CONNECT_TIMEOUT_MS.toLong())
 
-        // Launch worker pool
         val workers = List(WORKER_COUNT) {
             launch(Dispatchers.IO) {
-                for (ip in channel) {
-                    if (cancelled.get()) break 
-                    
-                    try {
-                        if (cancelled.get()) break
-                        
-                        // Application layer handshake
-                        val url = "https://$ip:$port/ping"
-                        
-                        val request = Request.Builder().url(url).build()
-                        scanClient.newCall(request).execute().use { response ->
-                            if (response.isSuccessful) {
-                                val body = response.body?.string()
-                                if (body != null && body.contains("ok")) {
-                                    if (found.compareAndSet(null, ip)) {
-                                        cancelled.set(true)
-                                        try { channel.close() } catch (e: Exception) {} 
+                try {
+                    for (ip in channel) {
+                        try {
+                            val url = "https://$ip:$port/ping"
+                            val request = Request.Builder()
+                                .url(url)
+                                .header("Authorization", "Bearer $pairingCode")
+                                .build()
+                            scanClient.newCall(request).execute().use { response ->
+                                if (response.isSuccessful) {
+                                    val body = response.body?.string()
+                                    if (body != null && body.contains("ok")) {
+                                        if (found.compareAndSet(null, ip)) {
+                                            channel.close()
+                                            this@supervisorScope.coroutineContext.cancelChildren()
+                                        }
                                     }
                                 }
                             }
-                        }
-                    } catch (e: Exception) {
-                        // Connection failed, continue to next IP
+                        } catch (e: Exception) { }
                     }
-                }
+                } catch (e: CancellationException) { }
             }
         }
 
-        // Feed IPs to channel
-        launch {
+        launch(Dispatchers.IO) {
             try {
                 for (ip in ips) {
-                    if (cancelled.get()) break
+                    if (found.get() != null) break
                     channel.send(ip)
                 }
-            } catch (e: kotlinx.coroutines.channels.ClosedSendChannelException) {
-                // Channel closed because server was found - this is expected
-            } finally {
-                try { channel.close() } catch (e: Exception) { }
-            }
+            } catch (e: Exception) { } finally { channel.close() }
         }
 
-        // Wait for workers to finish
-        workers.forEach { it.join() }
+        workers.forEach { 
+            try { it.join() } catch (e: CancellationException) { }
+        }
         
         found.get()
     }
 
-    /**
-     * Verifies a single manually-entered IP
-     */
     suspend fun verifyManualIp(
         ip: String,
         port: Int,
@@ -398,18 +328,12 @@ object NetworkScanner {
         onStatus: (String) -> Unit
     ): Boolean = withContext(Dispatchers.IO) {
         onStatus("Verifying $ip...")
-        
         try {
-            // Ping handshake directly (Socket check causes TLS EOF errors)
             val success = quickPing(ip, port, pairingCode)
-            if (success) {
-                onStatus("")
-            } else {
-                onStatus("Connection failed")
-            }
+            if (success) onStatus("") else onStatus("Failed")
             success
         } catch (e: Exception) {
-            onStatus("Connection failed")
+            onStatus("Failed")
             false
         }
     }

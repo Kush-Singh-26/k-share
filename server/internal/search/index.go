@@ -34,7 +34,7 @@ func (idx *Index) Build() error {
 			return nil
 		}
 		name := info.Name()
-		if name == ".trash" {
+		if strings.HasPrefix(name, ".") {
 			if info.IsDir() {
 				return filepath.SkipDir
 			}
@@ -70,17 +70,17 @@ func (idx *Index) Query(q string) []domain.SearchResult {
 		return []domain.SearchResult{}
 	}
 	var results []domain.SearchResult
+	count := 0
 	for _, e := range idx.entries {
 		if strings.Contains(strings.ToLower(e.Name), q) {
 			results = append(results, e)
+			count++
+			if count >= 100 {
+				break
+			}
 		}
 	}
 	return results
-}
-
-// NotifyUpdate triggers a background rebuild of the index.
-func (idx *Index) NotifyUpdate() {
-	go idx.Build()
 }
 
 // LastScan returns the time of the last successful index build.
@@ -88,37 +88,4 @@ func (idx *Index) LastScan() time.Time {
 	idx.mu.RLock()
 	defer idx.mu.RUnlock()
 	return idx.lastScan
-}
-
-// Worker periodically rebuilds the index.
-type Worker struct {
-	idx      *Index
-	interval time.Duration
-	stopCh   chan struct{}
-}
-
-// NewWorker creates a background re-index worker.
-func NewWorker(idx *Index, interval time.Duration) *Worker {
-	return &Worker{idx: idx, interval: interval, stopCh: make(chan struct{})}
-}
-
-// Start begins the periodic re-index loop.
-func (w *Worker) Start() {
-	go func() {
-		ticker := time.NewTicker(w.interval)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ticker.C:
-				_ = w.idx.Build()
-			case <-w.stopCh:
-				return
-			}
-		}
-	}()
-}
-
-// Stop halts the worker.
-func (w *Worker) Stop() {
-	close(w.stopCh)
 }

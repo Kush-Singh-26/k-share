@@ -70,26 +70,45 @@ func List(rootDir string, subPath string) ([]Entry, error) {
 	return entries, nil
 }
 
-func sanitizeFilename(name string) string {
-	name = strings.ReplaceAll(name, "..", "")
-	name = strings.ReplaceAll(name, string(filepath.Separator), "")
-	name = strings.ReplaceAll(name, "/", "")
-	name = strings.ReplaceAll(name, "\\", "")
-	// Remove null bytes and control characters
-	var b strings.Builder
-	for _, r := range name {
-		if r > 31 && r != 127 {
-			b.WriteRune(r)
+func sanitizeFilename(path string) string {
+	// 1. Clean the path and convert to logical forward slashes
+	path = filepath.ToSlash(filepath.Clean(path))
+	
+	// 2. Prevent escaping root via .. or absolute paths
+	if strings.Contains(path, "..") || strings.HasPrefix(path, "/") {
+		// If it's malicious, just fallback to base name for safety
+		path = filepath.Base(path)
+	}
+
+	// 3. Sanitize each segment
+	segments := strings.Split(path, "/")
+	var sanitized []string
+	for _, s := range segments {
+		if s == "" || s == "." || s == ".." {
+			continue
+		}
+		var b strings.Builder
+		for _, r := range s {
+			if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') ||
+				r == '.' || r == '-' || r == '_' || r == ' ' || r == '(' || r == ')' {
+				b.WriteRune(r)
+			}
+		}
+		clean := strings.TrimSpace(b.String())
+		if clean != "" {
+			sanitized = append(sanitized, clean)
 		}
 	}
-	name = b.String()
-	if name == "" {
-		name = "unnamed"
+	if len(sanitized) == 0 {
+		return "unnamed"
 	}
-	if len(name) > 255 {
-		name = name[:255]
+	result := strings.Join(sanitized, "/")
+	// 4. Final guard: ensure no trailing/leading dots that could be exploited on Windows
+	result = strings.Trim(result, ".")
+	if result == "" {
+		return "unnamed"
 	}
-	return name
+	return result
 }
 
 func Upload(rootDir, filename string, body io.Reader) error {
@@ -102,20 +121,29 @@ func Upload(rootDir, filename string, body io.Reader) error {
 	if err != nil {
 		return fmt.Errorf("invalid filename: %w", err)
 	}
-	destPath = serverstorage.UniqueFilename(destPath)
-
 	if err := os.MkdirAll(filepath.Dir(destPath), 0o755); err != nil {
 		return err
 	}
 
-	destFile, err := os.Create(destPath)
+	destFile, finalPath, err := serverstorage.CreateAtomic(destPath)
 	if err != nil {
 		return err
 	}
-	defer destFile.Close()
+	destPath = finalPath
+	
+	success := false
+	defer func() {
+		destFile.Close()
+		if !success {
+			_ = os.Remove(destPath)
+		}
+	}()
 
-	_, err = io.Copy(destFile, body)
-	return err
+	if _, err = io.Copy(destFile, body); err != nil {
+		return err
+	}
+	success = true
+	return nil
 }
 
 func Delete(rootDir, filename string) error {
@@ -125,7 +153,8 @@ func Delete(rootDir, filename string) error {
 		return err
 	}
 	if _, err := os.Stat(fullPath); os.IsNotExist(err) {
-		return os.ErrNotExist
+		// File already gone or doesn't exist - return success for idempotency
+		return nil
 	}
 
 	trashDir := filepath.Join(rootDir, ".trash")
@@ -219,6 +248,9 @@ func ServeDownload(rootDir, relPath string, w http.ResponseWriter, r *http.Reque
 				return nil
 			}
 			rel = filepath.ToSlash(rel)
+			if info.Mode()&os.ModeSymlink != 0 {
+				return nil // Skip symlinks in zip to prevent leakage/loops
+			}
 			if info.IsDir() {
 				_, err = zw.Create(rel + "/")
 				return err
@@ -227,12 +259,14 @@ func ServeDownload(rootDir, relPath string, w http.ResponseWriter, r *http.Reque
 			if err != nil {
 				return err
 			}
-			defer f.Close()
+			
 			dest, err := zw.Create(rel)
 			if err != nil {
+				f.Close()
 				return err
 			}
 			_, err = io.Copy(dest, f)
+			f.Close()
 			return err
 		})
 	}

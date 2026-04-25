@@ -91,7 +91,18 @@ func Save(cfg Config) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(Path(), data, 0o644)
+	path := Path()
+	tmpPath := path + ".tmp"
+	// Write to temporary file first
+	if err := os.WriteFile(tmpPath, data, 0o600); err != nil {
+		return err
+	}
+	// Atomic rename to target path
+	if err := os.Rename(tmpPath, path); err != nil {
+		_ = os.Remove(tmpPath)
+		return err
+	}
+	return nil
 }
 
 func RandomCode(length int) string {

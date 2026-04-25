@@ -1,6 +1,7 @@
 package api
 
 import (
+	"desktop-app/crypto"
 	"net/http"
 	"net/http/httptest"
 	"sync"
@@ -29,6 +30,11 @@ func TestWSClient_Race(t *testing.T) {
 	// Extract IP and Port from test server
 	serverAddr := s.Listener.Addr().String()
 
+	// Trust the test server certificate
+	cert := s.Certificate()
+	hash := crypto.GetCertHash(cert)
+	crypto.Manager.TrustCertificate(hash, serverAddr, "Test Server", "test-token")
+
 	ws := NewWSClient(serverAddr, "test-token")
 	
 	// Rigged for test (skip cert check handled by crypto.CreateTLSConfig(nil) 
@@ -41,7 +47,6 @@ func TestWSClient_Race(t *testing.T) {
 	go func() {
 		defer wg.Done()
 		for i := 0; i < 10; i++ {
-			ws.ReArm()
 			_ = ws.Connect()
 			time.Sleep(10 * time.Millisecond)
 			ws.Close()
@@ -62,7 +67,7 @@ func TestWSClient_Race(t *testing.T) {
 	go func() {
 		defer wg.Done()
 		for i := 0; i < 20; i++ {
-			ws.OnClipUpdate = func() {}
+			ws.SetOnClipUpdate(func() {})
 			time.Sleep(5 * time.Millisecond)
 		}
 	}()
@@ -91,6 +96,12 @@ func TestWSClient_Reconnection(t *testing.T) {
 	defer s.Close()
 
 	serverAddr := s.Listener.Addr().String()
+	
+	// Trust the test server certificate
+	cert := s.Certificate()
+	hash := crypto.GetCertHash(cert)
+	crypto.Manager.TrustCertificate(hash, serverAddr, "Test Server", "test-token")
+
 	ws := NewWSClient(serverAddr, "test-token")
 	
 	// We want to test if it tries to reconnect

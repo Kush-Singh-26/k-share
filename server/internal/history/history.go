@@ -1,6 +1,8 @@
 package history
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -57,19 +59,27 @@ func (s *Store) save() error {
 		return err
 	}
 	tmp := s.Path() + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+	if err := os.WriteFile(tmp, data, 0o600); err != nil {
 		return err
 	}
 	return os.Rename(tmp, s.Path())
 }
 
 func (s *Store) List() ([]Item, error) {
+	// P1: Handle lazy loading safely without mutation in RLock
 	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	if err := s.load(); err != nil {
-		return nil, err
+	if !s.loaded {
+		s.mu.RUnlock()
+		s.mu.Lock()
+		// Double check after acquiring full lock
+		if err := s.load(); err != nil {
+			s.mu.Unlock()
+			return nil, err
+		}
+		s.mu.Unlock()
+		s.mu.RLock()
 	}
+	defer s.mu.RUnlock()
 
 	// Return a copy to avoid race on slice contents if caller modifies it
 	res := make([]Item, len(s.items))
@@ -89,8 +99,11 @@ func (s *Store) Add(text string) error {
 		return nil
 	}
 
+	ts := time.Now().UnixNano()
+	hash := sha256.Sum256([]byte(fmt.Sprintf("%s%d", text, ts)))
+	
 	item := Item{
-		ID:        fmt.Sprintf("%d", time.Now().UnixNano()),
+		ID:        hex.EncodeToString(hash[:])[:12],
 		Text:      text,
 		Timestamp: time.Now(),
 	}

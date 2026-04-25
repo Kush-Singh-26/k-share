@@ -18,5 +18,7 @@ data class MainUiState(
     val pendingTrustIp: String = "",
     val pendingTrustHash: String = "",
     val pendingTrustPort: Int = 26260,
-    val searchQuery: String = ""
+    val pendingTrustIsGuest: Boolean = false,
+    val searchQuery: String = "",
+    val currentPath: String = ""
 )

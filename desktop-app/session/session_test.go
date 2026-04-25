@@ -135,3 +135,54 @@ func TestManagerDiscoverUpdatesServerIP(t *testing.T) {
 		t.Fatalf("unexpected server ip: %q", m.ServerIP())
 	}
 }
+
+func TestManagerCompleteConnectionSetsAdminState(t *testing.T) {
+	api := &fakeAPI{}
+	ws := &fakeWS{}
+	trust := &fakeTrust{}
+	discover := &fakeDiscover{}
+	m := NewWithDependencies(api, ws, trust, discover, "192.168.1.6:26260", "422974")
+
+	m.CompleteConnection("admin")
+
+	if m.IsGuest() {
+		t.Fatal("expected admin mode")
+	}
+	if got := m.ClipboardChannel(); got != "" {
+		t.Fatalf("expected empty clipboard channel for admin, got %q", got)
+	}
+	if ws.calls != 1 {
+		t.Fatalf("expected websocket connect call, got %d", ws.calls)
+	}
+}
+
+func TestManagerCompleteConnectionAdminCaseInsensitive(t *testing.T) {
+	api := &fakeAPI{}
+	ws := &fakeWS{}
+	trust := &fakeTrust{}
+	discover := &fakeDiscover{}
+	for _, role := range []string{"ADMIN", "Admin", "admin"} {
+		m := NewWithDependencies(api, ws, trust, discover, "192.168.1.6:26260", "422974")
+		m.CompleteConnection(role)
+		if m.IsGuest() {
+			t.Fatalf("expected admin mode for role %q", role)
+		}
+	}
+}
+
+func TestManagerCompleteConnectionGuestCaseInsensitive(t *testing.T) {
+	api := &fakeAPI{}
+	ws := &fakeWS{}
+	trust := &fakeTrust{}
+	discover := &fakeDiscover{}
+	for _, role := range []string{"GUEST", "Guest", "guest"} {
+		m := NewWithDependencies(api, ws, trust, discover, "192.168.1.6:26260", "422974")
+		m.CompleteConnection(role)
+		if !m.IsGuest() {
+			t.Fatalf("expected guest mode for role %q", role)
+		}
+		if m.ClipboardChannel() != "guest" {
+			t.Fatalf("expected guest clipboard channel for role %q, got %q", role, m.ClipboardChannel())
+		}
+	}
+}

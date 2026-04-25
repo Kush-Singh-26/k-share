@@ -10,7 +10,9 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
+	"time"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/container"
@@ -63,7 +65,7 @@ func (a *App) connect() {
 				return
 			}
 			log.Printf("Connection failed: %v", err)
-			a.statusText.Set("🔴 Failed: " + err.Error())
+			a.setStatus("🔴 Failed: "+err.Error(), 5*time.Second)
 			return
 		}
 
@@ -136,7 +138,7 @@ func (a *App) showTrustDialog(certInfo *crypto.CertInfo, serverIP string, role s
 
 	cancelBtn := widget.NewButton("❌ Cancel", func() {
 		a.session.CancelPendingTrust()
-		a.statusText.Set("🔴 Connection cancelled")
+		a.setStatus("🔴 Connection cancelled", 3*time.Second)
 		trustWindow.Close()
 	})
 
@@ -159,29 +161,33 @@ func (a *App) autoDiscover() {
 		ip := a.session.Discover(discoveryPort, onStatus)
 		if ip != "" {
 			a.serverIP.Set(a.session.ServerIP())
-			a.statusText.Set("✅ Found: " + ip)
+			a.setStatus("✅ Found: "+ip, 3*time.Second)
 			a.connect()
 		} else {
-			a.statusText.Set("🔴 Server not found")
+			a.setStatus("🔴 Server not found", 3*time.Second)
 		}
 	}()
 }
 
 // Clipboard operations
 func (a *App) fetchClipboard() {
-	text, err := a.clipOps.FetchText(context.Background(), a.clipboardChannel)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	text, err := a.clipOps.FetchText(ctx, a.clipboardChannel)
 	if err != nil {
 		log.Printf("Fetch clipboard failed: %v", err)
-		a.statusText.Set("🔴 Fetch failed")
+		a.setStatus("🔴 Fetch failed", 3*time.Second)
 		return
 	}
 	a.clipboardText.Set(text)
-	a.statusText.Set("📋 Clipboard fetched")
+	a.setStatus("📋 Clipboard fetched", 3*time.Second)
 }
 
 func (a *App) pushClipboard() {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
 	text, _ := a.clipboardText.Get()
-	err := a.clipOps.PushText(context.Background(), text, a.clipboardChannel)
+	err := a.clipOps.PushText(ctx, text, a.clipboardChannel)
 	if err != nil {
 		log.Printf("Push clipboard failed: %v", err)
 		return
@@ -196,7 +202,9 @@ func (a *App) copyToSystemClipboard() {
 }
 
 func (a *App) fetchClipboardImage() {
-	data, err := a.clipOps.FetchImage(context.Background())
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	data, err := a.clipOps.FetchImage(ctx)
 	if err != nil {
 		log.Printf("Fetch clipboard image failed: %v", err)
 		return
@@ -204,17 +212,33 @@ func (a *App) fetchClipboardImage() {
 
 	a.lastImageHash = a.clipOps.SystemImageHash(data)
 	a.clipOps.WriteImageToSystemClipboard(data)
-	a.statusText.Set("📋 Image copied to clipboard")
+	a.setStatus("📋 Image copied to clipboard", 3*time.Second)
 }
 
 // File operations
 func (a *App) loadFiles() {
-	files, err := a.fileOps.ListFiles(context.Background(), "")
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	files, err := a.fileOps.ListFiles(ctx, a.currentPath)
 	if err != nil {
 		log.Printf("Load files failed: %v", err)
-		a.statusText.Set("🔴 Load failed: " + err.Error())
+		a.setStatus("🔴 Load failed: "+err.Error(), 5*time.Second)
 		return
 	}
+
+	// Update breadcrumb
+	displayPath := "📁 Root"
+	if a.currentPath != "" {
+		displayPath = "📁 Root / " + strings.ReplaceAll(a.currentPath, "/", " / ")
+		if a.backBtn != nil {
+			a.backBtn.Enable()
+		}
+	} else {
+		if a.backBtn != nil {
+			a.backBtn.Disable()
+		}
+	}
+	a.breadcrumbPath.Set(displayPath)
 
 	data := make([]interface{}, len(files))
 	for i, f := range files {
@@ -223,16 +247,40 @@ func (a *App) loadFiles() {
 	a.filesBinding.Set(data)
 }
 
+func (a *App) navigateUp() {
+	if a.currentPath == "" {
+		return
+	}
+	parts := strings.Split(a.currentPath, "/")
+	if len(parts) <= 1 {
+		a.currentPath = ""
+	} else {
+		a.currentPath = strings.Join(parts[:len(parts)-1], "/")
+	}
+	a.loadFiles()
+}
+
 func (a *App) downloadFile(file api.FileInfo) {
+	if file.IsDirectory {
+		a.currentPath = file.Name
+		a.loadFiles()
+		return
+	}
+	a.forceDownload(file)
+}
+
+func (a *App) forceDownload(file api.FileInfo) {
 	a.statusText.Set("📥 Downloading...")
 
 	go func() {
-		if err := a.fileOps.Download(context.Background(), file); err != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+		defer cancel()
+		if err := a.fileOps.Download(ctx, file); err != nil {
 			log.Printf("Download failed: %v", err)
-			a.statusText.Set("🔴 Download failed: " + err.Error())
+			a.setStatus("🔴 Download failed: "+err.Error(), 5*time.Second)
 			return
 		}
-		a.statusText.Set("✅ Downloaded: " + file.Name)
+		a.setStatus("✅ Downloaded: "+filepath.Base(file.Name), 3*time.Second)
 	}()
 }
 
@@ -248,22 +296,30 @@ func (a *App) uploadFile() {
 	a.statusText.Set("📤 Uploading...")
 
 	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+		defer cancel()
 		file, err := os.Open(filename)
 		if err != nil {
 			log.Printf("Open file failed: %v", err)
-			a.statusText.Set("🔴 Upload failed")
+			a.setStatus("🔴 Upload failed", 5*time.Second)
 			return
 		}
 		defer file.Close()
 
 		baseName := filepath.Base(filename)
-		if err := a.fileOps.UploadFile(context.Background(), baseName, file); err != nil {
+		uploadPath := baseName
+		if a.currentPath != "" {
+			uploadPath = a.currentPath + "/" + baseName
+		}
+
+		if err := a.fileOps.UploadFile(ctx, uploadPath, file); err != nil {
 			log.Printf("Upload failed: %v", err)
-			a.statusText.Set("🔴 Upload failed")
+			a.setStatus("🔴 Upload failed", 5*time.Second)
 			return
 		}
 
-		a.statusText.Set("✅ Uploaded: " + baseName)
+		a.setStatus("✅ Uploaded: "+baseName, 3*time.Second)
+		a.loadFiles()
 	}()
 }
 
@@ -280,12 +336,27 @@ func (a *App) uploadFolder() {
 	a.statusText.Set("📤 Uploading folder...")
 
 	go func() {
-		if err := a.fileOps.UploadFolder(context.Background(), folderPath); err != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+		defer cancel()
+		
+		// If we are in a subfolder, we need the service to know where to put it
+		// But UploadFolder currently uses folderName internally.
+		// Let's modify UploadFolder or handle it here.
+		// Looking at Service.UploadFolder, it uses filepath.Join(folderName, relPath)
+		// We should probably pass a target prefix.
+		
+		prefix := ""
+		if a.currentPath != "" {
+			prefix = a.currentPath + "/"
+		}
+
+		if err := a.fileOps.UploadFolderWithPrefix(ctx, folderPath, prefix); err != nil {
 			log.Printf("Failed to upload folder %s: %v", folderName, err)
-			a.statusText.Set("🔴 Upload failed")
+			a.setStatus("🔴 Upload failed", 5*time.Second)
 			return
 		}
-		a.statusText.Set("✅ Uploaded: " + folderName)
+		a.setStatus("✅ Uploaded: "+folderName, 3*time.Second)
+		a.loadFiles()
 	}()
 }
 
@@ -301,7 +372,7 @@ func (a *App) selectDownloadFolder() {
 	a.downloadFolder.Set(folderPath)
 	a.fileOps.SetDownloadFolder(folderPath)
 	_ = config.SetDownloadFolder(folderPath)
-	a.statusText.Set("✅ Folder set")
+	a.setStatus("✅ Folder set", 3*time.Second)
 }
 
 // History operations
@@ -309,7 +380,9 @@ func (a *App) loadHistory() {
 	if a.isGuest {
 		return
 	}
-	items, err := a.historyOps.Load(context.Background())
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	items, err := a.historyOps.Load(ctx)
 	if err != nil {
 		log.Printf("Load history failed: %v", err)
 		return
@@ -325,7 +398,9 @@ func (a *App) loadHistory() {
 }
 
 func (a *App) deleteHistoryItem(id string) {
-	if err := a.historyOps.Delete(context.Background(), id); err != nil {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	if err := a.historyOps.Delete(ctx, id); err != nil {
 		log.Printf("Delete history item failed: %v", err)
 		return
 	}
@@ -340,13 +415,16 @@ func (a *App) deleteFile(filename string) {
 	}
 
 	a.statusText.Set("🗑️ Deleting...")
+
 	go func() {
-		if err := a.fileOps.DeleteFile(context.Background(), filename); err != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		defer cancel()
+		if err := a.fileOps.DeleteFile(ctx, filename); err != nil {
 			log.Printf("Delete failed: %v", err)
-			a.statusText.Set("🔴 Delete failed: " + err.Error())
-			return
+			a.setStatus("🔴 Delete failed: "+err.Error(), 5*time.Second)
+		} else {
+			a.setStatus("✅ Deleted: "+filename, 3*time.Second)
 		}
-		a.statusText.Set("✅ Deleted: " + filename)
 		a.loadFiles()
 	}()
 }

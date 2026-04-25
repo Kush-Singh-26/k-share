@@ -8,6 +8,8 @@ const (
 	sidebarWidth = 22
 )
 
+const LogoHeight = 10 // Number of lines in the logo
+
 var (
 	// Non-AI-slop color palette: Grounded slate + warm amber accent
 	// Avoids vivid purples, teals, neons used by generic AI tools

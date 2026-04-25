@@ -1,0 +1,23 @@
+# Code Owners
+
+# Default owner
+* @Kush-Singh-26
+
+# Product directories
+/server @Kush-Singh-26
+/desktop-app @Kush-Singh-26
+/android-app @Kush-Singh-26
+
+# Documentation
+*.md
+/docs @Kush-Singh-26
+README.md @Kush-Singh-26
+CONTRIBUTING.md @Kush-Singh-26
+SECURITY.md @Kush-Singh-26
+CHANGELOG.md @Kush-Singh-26
+
+# CI/CD
+/.github/workflows @Kush-Singh-26
+
+# Release
+/.github/ISSUE_TEMPLATE @Kush-Singh-26

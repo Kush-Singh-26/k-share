@@ -103,7 +103,10 @@ class MainActivity : ComponentActivity() {
                         onConfirmDeleteFile = viewModel::confirmDeleteFile,
                         onDismissDeleteRequest = viewModel::clearDeleteRequest,
                         onAcceptTrust = viewModel::acceptPendingTrust,
-                        onDismissTrust = viewModel::dismissTrustDialog
+                        onDismissTrust = viewModel::dismissTrustDialog,
+                        onNavigateToFolder = viewModel::navigateToFolder,
+                        onNavigateToPath = viewModel::navigateToPath,
+                        onNavigateUp = viewModel::navigateUp
                     )
                 }
 

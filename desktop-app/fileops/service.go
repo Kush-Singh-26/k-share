@@ -47,7 +47,21 @@ func (s *Service) Download(ctx context.Context, file api.FileInfo) error {
 }
 
 func (s *Service) DownloadWithProgress(ctx context.Context, file api.FileInfo, progressFn func(float64)) error {
-	basePath := filepath.Join(s.getDownloadFolder(), file.Name)
+	downloadFolder := s.getDownloadFolder()
+	basePath := filepath.Join(downloadFolder, filepath.Base(file.Name))
+	// Re-verify that it's within downloadFolder just in case
+	absBase, err := filepath.Abs(basePath)
+	if err != nil {
+		return err
+	}
+	absRoot, err := filepath.Abs(downloadFolder)
+	if err != nil {
+		return err
+	}
+	if !strings.HasPrefix(absBase, absRoot) {
+		return fmt.Errorf("path traversal attempt blocked: %s", file.Name)
+	}
+
 	downloadPath, extractFolder := planDownloadTargets(basePath, file)
 
 	if err := os.MkdirAll(filepath.Dir(downloadPath), 0o755); err != nil {
@@ -113,6 +127,10 @@ func (s *Service) UploadFile(ctx context.Context, filename string, reader io.Rea
 }
 
 func (s *Service) UploadFolder(ctx context.Context, folderPath string) error {
+	return s.UploadFolderWithPrefix(ctx, folderPath, "")
+}
+
+func (s *Service) UploadFolderWithPrefix(ctx context.Context, folderPath string, prefix string) error {
 	folderName := filepath.Base(folderPath)
 	return filepath.Walk(folderPath, func(path string, info os.FileInfo, err error) error {
 		if err != nil || info.IsDir() {
@@ -127,7 +145,9 @@ func (s *Service) UploadFolder(ctx context.Context, folderPath string) error {
 		}
 
 		relPath, _ := filepath.Rel(folderPath, path)
-		fullRelPath := filepath.Join(folderName, relPath)
+		fullRelPath := prefix + filepath.Join(folderName, relPath)
+		// Ensure forward slashes for server compatibility
+		fullRelPath = filepath.ToSlash(fullRelPath)
 
 		file, err := os.Open(path)
 		if err != nil {
@@ -186,7 +206,25 @@ func unzip(src, dest string) error {
 		return err
 	}
 
+	// P1: ZIP extraction guardrails
+	const (
+		MaxFiles          = 10000
+		MaxTotalSize      = 1024 * 1024 * 1024 // 1GB
+		MaxPerEntrySize   = 200 * 1024 * 1024  // 200MB
+	)
+
+	if len(r.File) > MaxFiles {
+		return fmt.Errorf("zip contains too many files (%d > %d)", len(r.File), MaxFiles)
+	}
+
+	var totalUncompressedSize int64
+
 	extractAndWriteFile := func(f *zip.File) error {
+		// Basic per-entry size check (header-based)
+		if f.UncompressedSize64 > MaxPerEntrySize {
+			return fmt.Errorf("file %s is too large (%d > %d)", f.Name, f.UncompressedSize64, MaxPerEntrySize)
+		}
+
 		rc, err := f.Open()
 		if err != nil {
 			return err
@@ -212,8 +250,28 @@ func unzip(src, dest string) error {
 		}
 		defer out.Close()
 
-		_, err = io.Copy(out, rc)
-		return err
+		// P1: Use LimitReader to enforce per-entry cap and update cumulative total
+		lr := io.LimitReader(rc, MaxPerEntrySize)
+		n, err := io.Copy(out, lr)
+		if err != nil {
+			return err
+		}
+		
+		// If we hit the limit, it means the file was larger than MaxPerEntrySize
+		if n >= MaxPerEntrySize {
+			// Check if there is still data in the original reader
+			tmp := make([]byte, 1)
+			if tn, _ := rc.Read(tmp); tn > 0 {
+				return fmt.Errorf("file %s exceeded maximum entry size %d", f.Name, MaxPerEntrySize)
+			}
+		}
+
+		totalUncompressedSize += n
+		if totalUncompressedSize > MaxTotalSize {
+			return fmt.Errorf("cumulative uncompressed size exceeded limit (%d > %d)", totalUncompressedSize, MaxTotalSize)
+		}
+
+		return nil
 	}
 
 	for _, f := range r.File {

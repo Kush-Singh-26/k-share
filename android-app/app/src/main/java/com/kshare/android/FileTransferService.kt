@@ -129,20 +129,21 @@ class FileTransferService : Service() {
 
                 var lastUpdateTime = System.currentTimeMillis()
                 val success = ApiClient.uploadFile(serverIp, serverPort, inputStream, fileName, pairingCode, length) { sent, total ->
-                    if (!isActive) return@uploadFile
+                    if (!isActive) return@uploadFile false
                     val currentTime = System.currentTimeMillis()
                     val progress = if (total > 0) (sent * 100 / total).toInt() else -1
                     if (currentTime - lastUpdateTime > 1000 || sent == total) {
                         updateNotification(notifId, "Uploading $fileName", progress)
                         lastUpdateTime = currentTime
                     }
+                    true
                 }
 
                 withContext(Dispatchers.Main) {
-                    showCompletionNotification(System.currentTimeMillis().toInt(), if (success) "Upload complete: $fileName" else "Upload failed: $fileName")
+                    showCompletionNotification(notifId, if (success) "Upload complete: $fileName" else "Upload failed: $fileName")
                 }
             } catch (e: Exception) {
-                withContext(Dispatchers.Main) { showCompletionNotification(System.currentTimeMillis().toInt(), "Upload error: ${e.message}") }
+                withContext(Dispatchers.Main) { showCompletionNotification(notifId, "Upload error: ${e.message}") }
             } finally {
                 if (activeTasks.decrementAndGet() == 0) stopForegroundCompat()
                 stopSelf(startId)
@@ -165,18 +166,19 @@ class FileTransferService : Service() {
 
                     var lastUpdateTime = System.currentTimeMillis()
                     val success = ApiClient.uploadFile(serverIp, serverPort, inputStream, fileName, pairingCode, length) { sent, total ->
-                        if (!isActive) return@uploadFile
+                        if (!isActive) return@uploadFile false
                         val currentTime = System.currentTimeMillis()
                         if (currentTime - lastUpdateTime > 1000 || sent == total) {
                             val progress = if (total > 0) (sent * 100 / total).toInt() else -1
                             updateNotification(notifId, "Uploading (${index + 1}/${uris.size}): $fileName", progress)
                             lastUpdateTime = currentTime
                         }
+                        true
                     }
                     if (success) successCount++
                 } catch (e: Exception) { e.printStackTrace() }
             }
-            withContext(Dispatchers.Main) { showCompletionNotification(System.currentTimeMillis().toInt(), "Uploaded $successCount/${uris.size} files") }
+            withContext(Dispatchers.Main) { showCompletionNotification(notifId, "Uploaded $successCount/${uris.size} files") }
             if (activeTasks.decrementAndGet() == 0) stopForegroundCompat()
             stopSelf(startId)
         }
@@ -217,7 +219,7 @@ class FileTransferService : Service() {
                 count(rootDoc)
 
                 if (totalFiles == 0) {
-                    withContext(Dispatchers.Main) { showCompletionNotification(System.currentTimeMillis().toInt(), "Folder is empty") }
+                    withContext(Dispatchers.Main) { showCompletionNotification(notifId, "Folder is empty") }
                     return@launch
                 }
 
@@ -235,13 +237,14 @@ class FileTransferService : Service() {
                         try {
                             val inputStream = contentResolver.openInputStream(doc.uri) ?: return
                             val success = ApiClient.uploadFile(serverIp, serverPort, inputStream, "$path$name", pairingCode, doc.length()) { sent, total ->
-                                if (!isActive) return@uploadFile
+                                if (!isActive) return@uploadFile false
                                 val currentTime = System.currentTimeMillis()
                                 if (currentTime - lastUpdateTime > 1000 || sent == total) {
                                     val progress = if (total > 0) (sent * 100 / total).toInt() else -1
                                     updateNotification(notifId, "Uploading ($currentFileIndex/$totalFiles): $name", progress)
                                     lastUpdateTime = currentTime
                                 }
+                                true
                             }
                             if (success) successCount++
                         } catch (e: Exception) { e.printStackTrace() }
@@ -255,10 +258,10 @@ class FileTransferService : Service() {
                 }
 
                 withContext(Dispatchers.Main) {
-                    showCompletionNotification(System.currentTimeMillis().toInt(), "Uploaded $successCount/$totalFiles files from $rootName")
+                    showCompletionNotification(notifId, "Uploaded $successCount/$totalFiles files from $rootName")
                 }
             } catch (e: Exception) {
-                withContext(Dispatchers.Main) { showCompletionNotification(System.currentTimeMillis().toInt(), "Folder upload error: ${e.message}") }
+                withContext(Dispatchers.Main) { showCompletionNotification(notifId, "Folder upload error: ${e.message}") }
             } finally {
                 if (activeTasks.decrementAndGet() == 0) stopForegroundCompat()
                 stopSelf(startId)
@@ -308,11 +311,9 @@ class FileTransferService : Service() {
                                 val finalName = if (count == 0) fileName else "$fileName ($count)"
                                 val finalTarget = rootDoc.createDirectory(finalName) ?: throw Exception("Failed to create folder")
                                 unzipToDoc(tempZip, finalTarget)
-                                withContext(Dispatchers.Main) { showDownloadCompleteNotification(System.currentTimeMillis().toInt(), finalTarget.name ?: fileName, finalTarget.uri.toString()) }
+                                withContext(Dispatchers.Main) { showDownloadCompleteNotification(notifId, finalTarget.name ?: fileName, finalTarget.uri.toString()) }
                             } else throw Exception("Custom folder inaccessible")
                         } else {
-                            // Prefer app-specific external files directory for downloads to avoid using deprecated
-                            // Environment.getExternalStoragePublicDirectory directly where possible.
                             val downloadsDir = getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS) ?: Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
                             var targetDir = File(downloadsDir, fileName)
                             var count = 0
@@ -322,32 +323,31 @@ class FileTransferService : Service() {
                             }
                             targetDir.mkdirs()
                             unzip(tempZip, targetDir)
-                            withContext(Dispatchers.Main) { showDownloadCompleteNotification(System.currentTimeMillis().toInt(), targetDir.name) }
+                            withContext(Dispatchers.Main) { showDownloadCompleteNotification(notifId, targetDir.name) }
                         }
                         tempZip.delete()
                     } else {
                         if (customUri.isNotEmpty()) {
                             val rootDoc = DocumentFile.fromTreeUri(this@FileTransferService, Uri.parse(customUri))
                             if (rootDoc != null && rootDoc.canWrite()) {
-                                var name = fileName
-                                var count = 1
-                                val nameWithoutExt = fileName.substringBeforeLast(".")
-                                val ext = fileName.substringAfterLast(".", "")
-
-                                while (rootDoc.findFile(name) != null) {
-                                    name = if (ext.isNotEmpty()) "$nameWithoutExt ($count).$ext" else "$nameWithoutExt ($count)"
+                                var count = 0
+                                var finalName = fileName
+                                while (rootDoc.findFile(finalName) != null) {
                                     count++
+                                    val nameWithoutExt = File(fileName).nameWithoutExtension
+                                    val ext = File(fileName).extension
+                                    finalName = if (ext.isNotEmpty()) "$nameWithoutExt ($count).$ext" else "$fileName ($count)"
                                 }
-
-                                val mimeType = MimeTypeMap.getSingleton().getMimeTypeFromExtension(ext.lowercase()) ?: "application/octet-stream"
-                                val newFile = rootDoc.createFile(mimeType, name) ?: throw Exception("Failed to create file")
-
-                                contentResolver.openOutputStream(newFile.uri).use { output ->
-                                    if (output == null) throw Exception("Failed to open output")
+                                val outputFile = rootDoc.createFile("application/octet-stream", finalName)
+                                    ?: throw Exception("Failed to create file")
+                                val pfd = contentResolver.openFileDescriptor(outputFile.uri, "w")
+                                    ?: throw Exception("Failed to open file descriptor")
+                                FileOutputStream(pfd.fileDescriptor).use { output ->
+                                    val input = encryptedStream
                                     val buffer = ByteArray(64 * 1024)
                                     var totalRead = 0L
                                     var read = 0
-                                    while (isActive && encryptedStream.read(buffer).also { read = it } != -1) {
+                                    while (isActive && input.read(buffer).also { read = it } != -1) {
                                         output.write(buffer, 0, read)
                                         totalRead += read
                                         val currentTime = System.currentTimeMillis()
@@ -358,7 +358,8 @@ class FileTransferService : Service() {
                                         }
                                     }
                                 }
-                                withContext(Dispatchers.Main) { showDownloadCompleteNotification(System.currentTimeMillis().toInt(), newFile.name ?: fileName, rootDoc.uri.toString()) }
+                                pfd.close()
+                                withContext(Dispatchers.Main) { showDownloadCompleteNotification(notifId, finalName, outputFile.uri.toString()) }
                             } else throw Exception("Custom folder inaccessible")
                         } else {
                             val downloadsDir = getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS) ?: Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
@@ -376,34 +377,31 @@ class FileTransferService : Service() {
                             val tempFile = File(cacheDir, "resumable_${fileName.hashCode()}.tmp")
                             val startOffset = if (tempFile.exists()) tempFile.length() else 0L
 
-                            ApiClient.downloadFile(serverIp, serverPort, fileName, pairingCode, startOffset) { encryptedStream, total ->
-                                FileOutputStream(tempFile, startOffset > 0).use { output ->
-                                    val input = encryptedStream
-                                    val buffer = ByteArray(64 * 1024)
-                                    var totalRead = startOffset
-                                    val trueTotal = total + startOffset
-                                    var read = 0
-                                    while (isActive && input.read(buffer).also { read = it } != -1) {
-                                        output.write(buffer, 0, read)
-                                        totalRead += read
-                                        val currentTime = System.currentTimeMillis()
-                                        if (currentTime - startTime > 1000) {
-                                            val progress = if (trueTotal > 0) (totalRead * 100 / trueTotal).toInt() else -1
-                                            updateNotification(notifId, "Downloading $fileName", progress)
-                                            startTime = currentTime
-                                        }
+                            FileOutputStream(tempFile, startOffset > 0).use { output ->
+                                val input = encryptedStream
+                                val buffer = ByteArray(64 * 1024)
+                                var totalRead = startOffset
+                                val trueTotal = total + startOffset
+                                var read = 0
+                                while (isActive && input.read(buffer).also { read = it } != -1) {
+                                    output.write(buffer, 0, read)
+                                    totalRead += read
+                                    val currentTime = System.currentTimeMillis()
+                                    if (currentTime - startTime > 1000) {
+                                        val progress = if (trueTotal > 0) (totalRead * 100 / trueTotal).toInt() else -1
+                                        updateNotification(notifId, "Downloading $fileName", progress)
+                                        startTime = currentTime
                                     }
                                 }
-                                // Rename temp to final
-                                tempFile.renameTo(outputFile)
-                                MediaScannerConnection.scanFile(this@FileTransferService, arrayOf(outputFile.absolutePath), null, null)
                             }
-                            withContext(Dispatchers.Main) { showDownloadCompleteNotification(System.currentTimeMillis().toInt(), outputFile.name) }
+                            tempFile.renameTo(outputFile)
+                            MediaScannerConnection.scanFile(this@FileTransferService, arrayOf(outputFile.absolutePath), null, null)
+                            withContext(Dispatchers.Main) { showDownloadCompleteNotification(notifId, outputFile.name) }
                         }
                     }
                 }
             } catch (e: Exception) {
-                withContext(Dispatchers.Main) { showCompletionNotification(System.currentTimeMillis().toInt(), "Download error: ${e.message}") }
+                withContext(Dispatchers.Main) { showCompletionNotification(notifId, "Download error: ${e.message}") }
             } finally {
                 if (activeTasks.decrementAndGet() == 0) stopForegroundCompat()
                 stopSelf(startId)
@@ -483,7 +481,7 @@ class FileTransferService : Service() {
         val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
         wakeLock = powerManager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "KShare:TransferWakeLock").apply {
             setReferenceCounted(false)
-            acquire(10 * 60 * 1000L) // 10 minutes max
+            acquire(60 * 60 * 1000L) // 1 hour max
         }
     }
 
@@ -564,8 +562,6 @@ class FileTransferService : Service() {
         }
         intent.flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK
 
-        // Fix: Use the notification 'id' as the requestCode and add FLAG_UPDATE_CURRENT
-        // to prevent reusing the same intent from previous notifications.
         val pendingIntent = PendingIntent.getActivity(this, id, intent, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
 
         val notification = NotificationCompat.Builder(this, "transfer")

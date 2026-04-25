@@ -1,9 +1,9 @@
 package auth
 
 import (
+	"crypto/subtle"
 	"fmt"
 	"net/http"
-	"os"
 	"path/filepath"
 	"strings"
 
@@ -12,15 +12,22 @@ import (
 
 func Role(r *http.Request, cfg *serverconfig.Config) string {
 	auth := r.Header.Get("Authorization")
-	if auth == "" {
+	code := ""
+	if auth != "" {
+		code = strings.TrimPrefix(auth, "Bearer ")
+	} else {
+		// Fallback to query parameter for WebSockets
+		code = r.URL.Query().Get("token")
+	}
+
+	if code == "" {
 		return "none"
 	}
 
-	code := strings.TrimPrefix(auth, "Bearer ")
-	if code == cfg.AdminCode {
+	if subtle.ConstantTimeCompare([]byte(code), []byte(cfg.AdminCode)) == 1 {
 		return "admin"
 	}
-	if code == cfg.GuestCode {
+	if subtle.ConstantTimeCompare([]byte(code), []byte(cfg.GuestCode)) == 1 {
 		return "guest"
 	}
 	return "none"
@@ -31,11 +38,7 @@ func EffectiveRoot(r *http.Request, cfg *serverconfig.Config) (string, error) {
 	case "admin":
 		return cfg.SharedDir, nil
 	case "guest":
-		publicDir := filepath.Join(cfg.SharedDir, "Public")
-		if err := os.MkdirAll(publicDir, 0o755); err != nil {
-			return "", err
-		}
-		return publicDir, nil
+		return filepath.Join(cfg.SharedDir, "Public"), nil
 	default:
 		return "", fmt.Errorf("unauthorized")
 	}

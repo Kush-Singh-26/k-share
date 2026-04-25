@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/charmbracelet/bubbles/list"
 	tea "github.com/charmbracelet/bubbletea"
@@ -48,7 +49,9 @@ func (i filesListItem) FilterValue() string { return filepath.Base(i.file.Name) 
 
 func (m *AppModel) fetchFilesCmd() tea.Cmd {
 	return func() tea.Msg {
-		files, err := m.fileOps.ListFiles(context.Background(), m.currentPath)
+		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		defer cancel()
+		files, err := m.fileOps.ListFiles(ctx, m.currentPath)
 		if err != nil {
 			return filesOpResultMsg{err: err}
 		}
@@ -65,6 +68,7 @@ func (m *AppModel) updateFilesList(msg tea.Msg) (tea.Model, tea.Cmd) {
 		
 		if didSelect, path := m.filePicker.DidSelectFile(msg); didSelect {
 			m.isLoading = true
+			m.isUploading = true
 			m.statusMsg = Branding.GetIcon(IconLoading, "") + fmt.Sprintf("Uploading %s...", filepath.Base(path))
 			m.showFilePicker = false // close picker
 			
@@ -74,26 +78,31 @@ func (m *AppModel) updateFilesList(msg tea.Msg) (tea.Model, tea.Cmd) {
 				uploadName = m.currentPath + "/" + uploadName
 			}
 
-			return m, tea.Batch(cmd, func() tea.Msg {
-				f, err := os.Open(path)
-				if err != nil {
-					return filesOpResultMsg{err: err}
-				}
-				defer f.Close()
+			return m, tea.Batch(
+				func() tea.Msg { return m.spinner.Tick() },
+				func() tea.Msg {
+					ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+					defer cancel()
+					f, err := os.Open(path)
+					if err != nil {
+						return filesOpResultMsg{err: err}
+					}
+					defer f.Close()
 
-				stat, err := f.Stat()
-				if err != nil {
-					return filesOpResultMsg{err: err}
-				}
+					stat, err := f.Stat()
+					if err != nil {
+						return filesOpResultMsg{err: err}
+					}
 
-				progressReader := NewProgressReader(f, stat.Size(), m.program)
+					progressReader := NewProgressReader(f, stat.Size(), m.program)
 
-				err = m.fileOps.UploadFile(context.Background(), uploadName, progressReader)
-				if err != nil {
-					return filesOpResultMsg{err: err}
-				}
-				return filesOpResultMsg{msg: fmt.Sprintf("Uploaded: %s", filepath.Base(path))}
-			})
+					err = m.fileOps.UploadFile(ctx, uploadName, progressReader)
+					if err != nil {
+						return filesOpResultMsg{err: err}
+					}
+					return filesOpResultMsg{msg: fmt.Sprintf("Uploaded: %s", filepath.Base(path))}
+				},
+			)
 		}
 		
 		// cancel picker with ESC
@@ -121,19 +130,33 @@ func (m *AppModel) updateFilesList(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			listItems = append(listItems, filesListItem{file: f, app: m})
 		}
-		cmd = m.filesList.SetItems(listItems)
+		
+		if len(listItems) == 0 && m.currentPath == "" {
+			m.filesList.SetItems([]list.Item{})
+		} else {
+			cmd = m.filesList.SetItems(listItems)
+		}
 		m.statusMsg = Branding.GetIcon(IconSuccess, "") + fmt.Sprintf("Loaded %d files", len(msg.files))
 		return m, cmd
 
 	case filesOpResultMsg:
+		if msg.status != "" {
+			m.statusMsg = msg.status
+			return m, nil
+		}
 		m.isLoading = false
+		m.isDownloading = false
+		m.isUploading = false
+		
+		m.selectedFiles = make(map[string]bool) // Always clear selection
+		
 		if msg.err != nil {
 			m.statusMsg = fmt.Sprintf("%s Error: %v", IconError, msg.err)
-			return m, nil
+			// Still refresh to show current state even after partial error
+			return m, tea.Batch(m.fetchFilesCmd(), m.clearToastCmd())
 		}
 		m.statusMsg = Branding.GetIcon(IconSuccess, "") + msg.msg
 		m.toastMsg = msg.msg
-		m.selectedFiles = make(map[string]bool) // Clear selection on success
 		return m, tea.Batch(m.fetchFilesCmd(), m.clearToastCmd())
 
 	case tea.KeyMsg:
@@ -210,61 +233,171 @@ func (m *AppModel) updateFilesList(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.isLoading = true
 			m.isDownloading = true
 			m.statusMsg = Branding.GetIcon(IconLoading, "") + fmt.Sprintf("Downloading %d files...", len(filesToDownload))
-			
-			return m, func() tea.Msg {
-				for _, f := range filesToDownload {
-					err := m.fileOps.DownloadWithProgress(context.Background(), f, func(percent float64) {
-						if m.program != nil {
-							m.program.Send(progressMsg{percent: percent, isDownload: true})
+
+			return m, tea.Batch(
+				func() tea.Msg { return m.spinner.Tick() },
+				func() tea.Msg {
+					ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+					defer cancel()
+					for _, f := range filesToDownload {
+						err := m.fileOps.DownloadWithProgress(ctx, f, func(percent float64) {
+							// Skip throttling - let the fileops handle it
+							// The progress reader already throttles uploads
+						})
+						if err != nil {
+							return filesOpResultMsg{err: err}
 						}
-					})
+					}
+					return filesOpResultMsg{msg: fmt.Sprintf("Downloaded %d files", len(filesToDownload))}
+				},
+			)
+			}
+		case "d", "delete":
+			filesToDelete := []string{}
+			if len(m.selectedFiles) > 0 {
+				for name, selected := range m.selectedFiles {
+					if selected {
+						filesToDelete = append(filesToDelete, name)
+					}
+				}
+			} else {
+				if i, ok := m.filesList.SelectedItem().(filesListItem); ok {
+					if i.file.Name != ".." {
+						filesToDelete = append(filesToDelete, i.file.Name)
+					}
+				}
+			}
+
+			if len(filesToDelete) == 0 {
+				return m, nil
+			}
+
+			m.showConfirm = true
+			m.pendingActionLabel = fmt.Sprintf("delete %d files", len(filesToDelete))
+			m.pendingActionTarget = strings.Join(filesToDelete, ", ")
+			if len(m.pendingActionTarget) > 40 {
+				m.pendingActionTarget = m.pendingActionTarget[:37] + "..."
+			}
+
+			m.pendingAction = func() tea.Cmd {
+				return func() tea.Msg {
+					ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+					defer cancel()
+					
+					var errors []string
+					for _, fname := range filesToDelete {
+						err := m.fileOps.DeleteFile(ctx, fname)
+						if err != nil {
+							errors = append(errors, fmt.Sprintf("%s: %v", filepath.Base(fname), err))
+						}
+					}
+					
+					if len(errors) > 0 {
+						if len(errors) == len(filesToDelete) {
+							return filesOpResultMsg{err: fmt.Errorf("all deletions failed: %s", strings.Join(errors, "; "))}
+						}
+						return filesOpResultMsg{
+							msg: fmt.Sprintf("Deleted %d/%d files (some errors occurred)", len(filesToDelete)-len(errors), len(filesToDelete)),
+						}
+					}
+					return filesOpResultMsg{msg: fmt.Sprintf("Deleted %d files", len(filesToDelete))}
+				}
+			}
+			return m, nil
+		case "shift+d":
+			// Shift+D is redundant now but keeping it consistent with the new robust logic
+			filesToDelete := []string{}
+			for name, selected := range m.selectedFiles {
+				if selected {
+					filesToDelete = append(filesToDelete, name)
+				}
+			}
+			if len(filesToDelete) == 0 {
+				return m, nil
+			}
+			m.showConfirm = true
+			m.pendingActionLabel = fmt.Sprintf("delete %d files", len(filesToDelete))
+			m.pendingActionTarget = strings.Join(filesToDelete, ", ")
+			if len(m.pendingActionTarget) > 40 {
+				m.pendingActionTarget = m.pendingActionTarget[:37] + "..."
+			}
+			m.pendingAction = func() tea.Cmd {
+				return func() tea.Msg {
+					ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+					defer cancel()
+					var errors []string
+					for _, fname := range filesToDelete {
+						err := m.fileOps.DeleteFile(ctx, fname)
+						if err != nil {
+							errors = append(errors, fmt.Sprintf("%s: %v", filepath.Base(fname), err))
+						}
+					}
+					if len(errors) > 0 {
+						return filesOpResultMsg{msg: fmt.Sprintf("Deleted %d/%d files", len(filesToDelete)-len(errors), len(filesToDelete))}
+					}
+					return filesOpResultMsg{msg: fmt.Sprintf("Deleted %d files", len(filesToDelete))}
+				}
+			}
+			return m, nil
+		case "shift+enter":
+			// Download all selected files (batch action)
+			filesToDownload := []api.FileInfo{}
+			for _, item := range m.filesList.Items() {
+				if fItem, ok := item.(filesListItem); ok && m.selectedFiles[fItem.file.Name] {
+					filesToDownload = append(filesToDownload, fItem.file)
+				}
+			}
+			
+			// If nothing selected, try downloading the highlighted item
+			if len(filesToDownload) == 0 {
+				if i, ok := m.filesList.SelectedItem().(filesListItem); ok && i.file.Name != ".." {
+					filesToDownload = append(filesToDownload, i.file)
+				}
+			}
+
+			if len(filesToDownload) == 0 {
+				return m, nil
+			}
+			m.isLoading = true
+			m.isDownloading = true
+			m.statusMsg = Branding.GetIcon(IconLoading, "") + fmt.Sprintf("Downloading %d files...", len(filesToDownload))
+			return m, tea.Batch(
+				func() tea.Msg { return m.spinner.Tick() },
+				func() tea.Msg {
+					ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+					defer cancel()
+					for _, f := range filesToDownload {
+						err := m.fileOps.DownloadWithProgress(ctx, f, func(percent float64) {})
+						if err != nil {
+							return filesOpResultMsg{err: err}
+						}
+					}
+					return filesOpResultMsg{msg: fmt.Sprintf("Downloaded %d files", len(filesToDownload))}
+				},
+			)
+		case "alt+enter":
+			// Download current directory
+			m.isLoading = true
+			m.isDownloading = true
+			m.statusMsg = Branding.GetIcon(IconLoading, "") + "Downloading current folder..."
+			return m, tea.Batch(
+				func() tea.Msg { return m.spinner.Tick() },
+				func() tea.Msg {
+					ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+					defer cancel()
+					err := m.fileOps.DownloadWithProgress(ctx, api.FileInfo{
+						Name:        m.currentPath,
+						IsDirectory: true,
+					}, func(percent float64) {})
 					if err != nil {
 						return filesOpResultMsg{err: err}
 					}
-				}
-				return filesOpResultMsg{msg: fmt.Sprintf("Downloaded %d files", len(filesToDownload))}
-			}
-			}
-		case "d", "delete":
-			if i, ok := m.filesList.SelectedItem().(filesListItem); ok {
-				if i.file.Name == ".." {
-					return m, nil
-				}
-				
-				filesToDelete := []string{}
-				if len(m.selectedFiles) > 0 {
-					for name, selected := range m.selectedFiles {
-						if selected {
-							filesToDelete = append(filesToDelete, name)
-						}
-					}
-				} else {
-					filesToDelete = append(filesToDelete, i.file.Name)
-				}
-
-				m.showConfirm = true
-				m.pendingActionLabel = fmt.Sprintf("delete %d files", len(filesToDelete))
-				m.pendingActionTarget = strings.Join(filesToDelete, ", ")
-				if len(m.pendingActionTarget) > 40 {
-					m.pendingActionTarget = m.pendingActionTarget[:37] + "..."
-				}
-
-				m.pendingAction = func() tea.Cmd {
-					return func() tea.Msg {
-						for _, fname := range filesToDelete {
-							err := m.fileOps.DeleteFile(context.Background(), fname)
-							if err != nil {
-								return filesOpResultMsg{err: err}
-							}
-						}
-						return filesOpResultMsg{msg: fmt.Sprintf("Deleted %d files", len(filesToDelete))}
-					}
-				}
-				return m, nil
-			}
+					return filesOpResultMsg{msg: "Downloaded current folder"}
+				},
+			)
 		case "o":
 			return m, func() tea.Msg {
-				_ = platform.OpenFolder(config.Current.DownloadFolder)
+				_ = platform.OpenFolder(config.Get().DownloadFolder)
 				return nil
 			}
 		case "u":
@@ -272,8 +405,8 @@ func (m *AppModel) updateFilesList(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, m.filePicker.Init()
 		case "r":
 			m.isLoading = true
-			m.statusMsg = Branding.GetIcon(IconLoading, "") + "Fetching files..."
-			return m, m.fetchFilesCmd()
+			m.statusMsg = Branding.GetIcon(IconLoading, "") + "Refreshing all..."
+			return m, tea.Batch(func() tea.Msg { return m.spinner.Tick() }, m.refreshAllCmd())
 		}
 		m.filesList, cmd = m.filesList.Update(msg)
 	}

@@ -24,7 +24,8 @@ func DiscoverMDNS(timeout time.Duration) (*ServiceEntry, error) {
 		return nil, fmt.Errorf("failed to create mDNS resolver: %w", err)
 	}
 
-	entries := make(chan *zeroconf.ServiceEntry)
+	// Buffer size 16 to prevent goroutine leak if multiple servers found
+	entries := make(chan *zeroconf.ServiceEntry, 16)
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 

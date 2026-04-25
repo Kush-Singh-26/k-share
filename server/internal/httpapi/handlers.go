@@ -7,7 +7,9 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
+	"sync"
 
 	serverclipboard "github.com/Kush-Singh-26/k-share/server/internal/clipboardstore"
 	serverconfig "github.com/Kush-Singh-26/k-share/server/internal/config"
@@ -15,6 +17,7 @@ import (
 	serverfiles "github.com/Kush-Singh-26/k-share/server/internal/files"
 	serverhistory "github.com/Kush-Singh-26/k-share/server/internal/history"
 	serverrealtime "github.com/Kush-Singh-26/k-share/server/internal/realtime"
+	serversearch "github.com/Kush-Singh-26/k-share/server/internal/search"
 	serverthumbnail "github.com/Kush-Singh-26/k-share/server/internal/thumbnail"
 )
 
@@ -27,22 +30,29 @@ var allowedOrigins = map[string]bool{
 
 func setCORS(w http.ResponseWriter, r *http.Request) {
 	origin := r.Header.Get("Origin")
-	if allowedOrigins[origin] || strings.HasPrefix(origin, "https://localhost:") {
+	if allowedOrigins[origin] || 
+	   strings.HasPrefix(origin, "https://localhost:") ||
+	   strings.HasPrefix(origin, "http://localhost:") {
 		w.Header().Set("Access-Control-Allow-Origin", origin)
 	}
 }
 
-type Handlers struct {
-	Config           *serverconfig.Config
-	Hub              *serverrealtime.Hub
-	Clipboard        *serverclipboard.Store
-	History          *serverhistory.Store
-	Thumbnail        *serverthumbnail.Store
-	GetRole          func(*http.Request) string
-	GetEffectiveRoot func(*http.Request) (string, error)
-	AppDir           func() string
-	OpenURL          func(string) error
-}
+	type Handlers struct {
+		Config           *serverconfig.Config
+		ConfigMu         *sync.RWMutex
+		Hub              *serverrealtime.Hub
+		Clipboard        *serverclipboard.Store
+		History          *serverhistory.Store
+		Thumbnail        *serverthumbnail.Store
+		GetRole          func(*http.Request) string
+		GetEffectiveRoot func(*http.Request) (string, error)
+		AppDir           func() string
+		OpenURL          func(string) error
+		AdminIndex       *serversearch.Index
+		GuestIndex       *serversearch.Index
+		GetAdminIndex    func() *serversearch.Index
+		GetGuestIndex    func() *serversearch.Index
+	}
 
 func writeJSON(w http.ResponseWriter, v any) {
 	if err := json.NewEncoder(w).Encode(v); err != nil {
@@ -65,6 +75,7 @@ func (h Handlers) HandlePing(w http.ResponseWriter, r *http.Request) {
 		"status": "ok",
 		"name":   "K-Share Server",
 		"role":   role,
+		"proto":  "v1.2",
 	})
 }
 
@@ -73,6 +84,7 @@ func (h Handlers) HandleUpload(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+	setCORS(w, r)
 
 	rootDir, err := h.GetEffectiveRoot(r)
 	if err != nil {
@@ -80,7 +92,11 @@ func (h Handlers) HandleUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	filename := r.URL.Query().Get("name")
+	filename := r.URL.Query().Get("path")
+	if filename == "" {
+		http.Error(w, "Path required", http.StatusBadRequest)
+		return
+	}
 	r.Body = http.MaxBytesReader(w, r.Body, maxUploadSize)
 	log.Printf("📥 Receiving Stream: %s -> %s\n", filename, rootDir)
 	if err := serverfiles.Upload(rootDir, filename, r.Body); err != nil {
@@ -122,9 +138,12 @@ func (h Handlers) HandleDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	filename := r.URL.Query().Get("name")
+	filename := r.URL.Query().Get("path")
 	if filename == "" {
-		http.Error(w, "Missing filename", http.StatusBadRequest)
+		filename = r.URL.Query().Get("name") // Compatibility
+	}
+	if filename == "" {
+		http.Error(w, "Missing path", http.StatusBadRequest)
 		return
 	}
 
@@ -133,6 +152,7 @@ func (h Handlers) HandleDelete(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Unauthorized", http.StatusUnauthorized)
 		return
 	}
+	setCORS(w, r)
 
 	if err := serverfiles.Delete(rootDir, filename); err != nil {
 		if os.IsNotExist(err) {
@@ -147,6 +167,19 @@ func (h Handlers) HandleDelete(w http.ResponseWriter, r *http.Request) {
 	log.Printf("🗑️ Delete request: name='%s'", filename)
 	log.Printf("🗑️ Moved to trash: %s", filename)
 	w.WriteHeader(http.StatusOK)
+	// Immediate search index update to prevent stale results
+	if h.GetAdminIndex != nil {
+		adminIdx := h.GetAdminIndex()
+		if adminIdx != nil {
+			_ = adminIdx.Build()
+		}
+	}
+	if h.GetGuestIndex != nil {
+		guestIdx := h.GetGuestIndex()
+		if guestIdx != nil {
+			_ = guestIdx.Build()
+		}
+	}
 	h.Hub.Notify("files")
 }
 
@@ -183,14 +216,21 @@ func (h Handlers) HandleClipboard(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodPost {
 		r.Body = http.MaxBytesReader(w, r.Body, 1<<20) // 1 MB
 		body, err := io.ReadAll(r.Body)
+
 		if err != nil {
 			http.Error(w, "Request too large", http.StatusRequestEntityTooLarge)
 			return
 		}
 		appendMode := r.URL.Query().Get("mode") == "append"
-		_ = h.Clipboard.WriteText(targetFile, body, appendMode)
+		if err := h.Clipboard.WriteText(targetFile, body, appendMode); err != nil {
+			log.Printf("❌ Failed to write clipboard: %v", err)
+			http.Error(w, "Write failed", http.StatusInternalServerError)
+			return
+		}
 		if targetFile == "clipboard.txt" {
-			_ = h.History.Add(string(body))
+			if err := h.History.Add(string(body)); err != nil {
+				log.Printf("❌ Failed to add to history: %v", err)
+			}
 		}
 		log.Printf("📋 Clipboard updated (%s)", targetFile)
 		w.WriteHeader(http.StatusOK)
@@ -237,16 +277,26 @@ func (h Handlers) HandleHistory(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h Handlers) HandleThumbnail(w http.ResponseWriter, r *http.Request) {
-	name := r.URL.Query().Get("name")
-	folder := r.URL.Query().Get("folder")
+	relPath := r.URL.Query().Get("path")
+	if relPath == "" {
+		name := r.URL.Query().Get("name")
+		folder := r.URL.Query().Get("folder")
+		relPath = filepath.Join(folder, name)
+	}
+	if relPath == "" || strings.Contains(relPath, "..") {
+		http.Error(w, "Invalid path", http.StatusBadRequest)
+		return
+	}
 
 	dir, err := h.GetEffectiveRoot(r)
 	if err != nil {
 		http.Error(w, "Unauthorized", http.StatusUnauthorized)
 		return
 	}
+	setCORS(w, r)
 
-	if err := h.Thumbnail.Serve(dir, name, folder, w, r); err != nil {
+	if err := h.Thumbnail.Serve(dir, relPath, w, r); err != nil {
+		log.Printf("⚠️ Thumbnail error: %v", err)
 		http.Error(w, "Thumbnail failed", http.StatusInternalServerError)
 	}
 }
@@ -263,9 +313,10 @@ func (h Handlers) HandleOpen(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	r.Body = http.MaxBytesReader(w, r.Body, 4096) // 4KB limit for URLs
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
-		http.Error(w, "Read error", http.StatusInternalServerError)
+		http.Error(w, "Request too large", http.StatusRequestEntityTooLarge)
 		return
 	}
 
@@ -328,15 +379,23 @@ func (h Handlers) HandleClipboardImage(w http.ResponseWriter, r *http.Request) {
 	http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 }
 
-const downloadPrefix = "/download/"
-
 func (h Handlers) HandleDownload(w http.ResponseWriter, r *http.Request) {
-	relPath := strings.TrimPrefix(r.URL.Path, downloadPrefix)
+	relPath := strings.TrimPrefix(r.URL.Path, "/download/")
+	if relPath == "" {
+		http.Error(w, "Path required", http.StatusBadRequest)
+		return
+	}
+	// Prevent path traversal: block any encoded or raw path traversal sequences
+	if strings.Contains(relPath, "..") || strings.Contains(relPath, "%2e%2e") {
+		http.Error(w, "Invalid path", http.StatusBadRequest)
+		return
+	}
 	rootDir, err := h.GetEffectiveRoot(r)
 	if err != nil {
 		http.Error(w, "Unauthorized", http.StatusUnauthorized)
 		return
 	}
+	setCORS(w, r)
 	if err := serverfiles.ServeDownload(rootDir, relPath, w, r); err != nil {
 		http.Error(w, "Download failed", http.StatusInternalServerError)
 	}

@@ -38,26 +38,53 @@ import (
 	serverhttpapi "github.com/Kush-Singh-26/k-share/server/internal/httpapi"
 	serverplatform "github.com/Kush-Singh-26/k-share/server/internal/platform"
 	serverrealtime "github.com/Kush-Singh-26/k-share/server/internal/realtime"
+	serversearch "github.com/Kush-Singh-26/k-share/server/internal/search"
 	serverthumbnail "github.com/Kush-Singh-26/k-share/server/internal/thumbnail"
 )
 
-type App struct {
-	Config         *serverconfig.Config
-	Hub            *serverrealtime.Hub
-	ipMu           sync.RWMutex
-	lastKnownIP    string
-	Clipboard      *serverclipboard.Store
-	History        *serverhistory.Store
-	Thumbnail      *serverthumbnail.Store
-	AppDir         string
-	ThumbnailLimit int64
-	logFile        *os.File
-	stopCh         chan struct{}
-	mdnsRestartCh  chan struct{}
-	mIP            *systray.MenuItem
-	server         *http.Server
-	StartTime      time.Time
-}
+	type App struct {
+		Config         *serverconfig.Config
+		Hub            *serverrealtime.Hub
+		ipMu           sync.RWMutex
+		lastKnownIP    string
+		Clipboard      *serverclipboard.Store
+		History        *serverhistory.Store
+		Thumbnail      *serverthumbnail.Store
+		AppDir         string
+		ThumbnailLimit int64
+		logFile        *os.File
+		stopCh         chan struct{}
+		mdnsRestartCh  chan struct{}
+		mdnsMu         sync.Mutex
+		mIP            *systray.MenuItem
+		server         *http.Server
+		StartTime      time.Time
+		ConfigMu       sync.RWMutex
+		logMu          sync.Mutex
+		RateLimiter    *rateLimiter
+		indexMu        sync.RWMutex
+		adminIndex     *serversearch.Index
+		guestIndex     *serversearch.Index
+	}
+
+	func (a *App) getAdminIndex() *serversearch.Index {
+		a.indexMu.RLock()
+		defer a.indexMu.RUnlock()
+		return a.adminIndex
+	}
+
+	func (a *App) getGuestIndex() *serversearch.Index {
+		a.indexMu.RLock()
+		defer a.indexMu.RUnlock()
+		return a.guestIndex
+	}
+
+	func (a *App) setIndices(adminIdx, guestIdx *serversearch.Index) {
+		a.indexMu.Lock()
+		defer a.indexMu.Unlock()
+		a.adminIndex = adminIdx
+		a.guestIndex = guestIdx
+	}
 
 func Run(args []string) {
 	if len(args) > 1 {
@@ -98,15 +125,24 @@ func New() *App {
 		stopCh:         make(chan struct{}),
 		mdnsRestartCh:  make(chan struct{}),
 		StartTime:      time.Now(),
+		RateLimiter:    newRateLimiter(),
 	}
 }
 
 func (a *App) Run() {
 	a.setupLogging()
-	go a.Hub.Run()
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("Recovered from panic in Hub.Run: %v", r)
+			}
+		}()
+		a.Hub.Run()
+	}()
 
-	api := serverhttpapi.Handlers{
+	api := &serverhttpapi.Handlers{
 		Config:           a.Config,
+		ConfigMu:         &a.ConfigMu,
 		Hub:              a.Hub,
 		Clipboard:        a.Clipboard,
 		History:          a.History,
@@ -115,7 +151,81 @@ func (a *App) Run() {
 		GetEffectiveRoot: a.getEffectiveRoot,
 		AppDir:           a.getAppDir,
 		OpenURL:          serverplatform.OpenURL,
+		GetAdminIndex:    a.getAdminIndex,
+		GetGuestIndex:    a.getGuestIndex,
 	}
+
+	// Initial build
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("Recovered from panic in initial search index build: %v", r)
+			}
+		}()
+		a.ConfigMu.RLock()
+		sharedDir := a.Config.SharedDir
+		a.ConfigMu.RUnlock()
+
+		adminIdx := serversearch.NewIndex(sharedDir)
+		_ = adminIdx.Build()
+
+		guestDir := filepath.Join(sharedDir, "Public")
+		_ = os.MkdirAll(guestDir, 0o755)
+		guestIdx := serversearch.NewIndex(guestDir)
+		_ = guestIdx.Build()
+		a.setIndices(adminIdx, guestIdx)
+		log.Println("🔍 Search indices built")
+	}()
+
+	// Index Worker (Debounced)
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("Recovered from panic in search index worker: %v", r)
+			}
+		}()
+		
+		timer := time.NewTimer(1 * time.Hour) // Initial long duration
+		if !timer.Stop() {
+			select {
+			case <-timer.C:
+			default:
+			}
+		}
+		var pending bool
+
+		for {
+			select {
+			case msg := <-a.Hub.NotifyCh:
+				if msg == "files" {
+					pending = true
+					timer.Reset(5 * time.Second)
+				}
+			case <-timer.C:
+				if pending {
+					pending = false
+					log.Println("🔄 Refreshing search indices (debounced)...")
+					a.ConfigMu.RLock()
+					sharedDir := a.Config.SharedDir
+					a.ConfigMu.RUnlock()
+
+					newAdminIndex := serversearch.NewIndex(sharedDir)
+					_ = newAdminIndex.Build()
+
+					guestDir := filepath.Join(sharedDir, "Public")
+					_ = os.MkdirAll(guestDir, 0o755)
+					newGuestIndex := serversearch.NewIndex(guestDir)
+					_ = newGuestIndex.Build()
+
+					a.setIndices(newAdminIndex, newGuestIndex)
+					log.Println("✅ Search indices refreshed")
+				}
+			case <-a.stopCh:
+				timer.Stop()
+				return
+			}
+		}
+	}()
 
 	if err := os.MkdirAll(a.Config.SharedDir, 0755); err != nil {
 		log.Printf("❌ Failed to create SharedDir: %v", err)
@@ -124,9 +234,38 @@ func (a *App) Run() {
 	localIP := a.getOutboundIP()
 	a.setLastKnownIP(localIP.String())
 	log.Printf("📡 Local IP: %s\n", localIP)
-	go a.startIPMonitor()
-	go a.Thumbnail.StartEviction(a.ThumbnailLimit, time.Hour)
-	go a.startMDNS()
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("Recovered from panic in startIPMonitor: %v", r)
+			}
+		}()
+		a.startIPMonitor()
+	}()
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("Recovered from panic in StartEviction: %v", r)
+			}
+		}()
+		a.Thumbnail.StartEviction(a.ThumbnailLimit, time.Hour)
+	}()
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("Recovered from panic in startMDNS: %v", r)
+			}
+		}()
+		a.startMDNS()
+	}()
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("Recovered from panic in startLogRotationChecker: %v", r)
+			}
+		}()
+		a.startLogRotationChecker()
+	}()
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/ws", api.HandleWS)
@@ -144,6 +283,7 @@ func (a *App) Run() {
 
 	dash := serverdashboard.Handlers{
 		Config:    a.Config,
+		ConfigMu:  &a.ConfigMu,
 		Clipboard: a.Clipboard,
 		History:   a.History,
 		Hub:       a.Hub,
@@ -164,16 +304,28 @@ func (a *App) Run() {
 		log.Fatalf("❌ TLS cert generation failed: %v", err)
 	}
 
+	a.ConfigMu.RLock()
+	port := a.Config.Port
+	a.ConfigMu.RUnlock()
+
 	a.server = &http.Server{
-		Addr:           ":" + a.Config.Port,
+		Addr:           ":" + port,
 		Handler:        a.withMiddleware(mux),
 		ReadTimeout:    30 * time.Second,
 		WriteTimeout:   30 * time.Second,
 		IdleTimeout:    120 * time.Second,
 		MaxHeaderBytes: 1 << 20,
+		TLSConfig: &tls.Config{
+			MinVersion: tls.VersionTLS13,
+		},
 	}
 
 	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("Recovered from panic in ListenAndServeTLS: %v", r)
+			}
+		}()
 		log.Printf("🔒 Server listening on https://%s:%s", "0.0.0.0", a.Config.Port)
 		if err := a.server.ListenAndServeTLS(filepath.Join(a.getAppDir(), "cert.pem"), filepath.Join(a.getAppDir(), "key.pem")); err != nil && err != http.ErrServerClosed {
 			log.Printf("Server error: %v", err)
@@ -209,8 +361,12 @@ func (a *App) setLastKnownIP(ip string) {
 func (a *App) setupLogging() {
 	logFile := filepath.Join(a.getAppDir(), "server_log.txt")
 	if info, err := os.Stat(logFile); err == nil && info.Size() > 10*1024*1024 {
-		_ = os.Rename(logFile, logFile+".old")
+		a.rotateLogs(logFile)
 	}
+	
+	a.logMu.Lock()
+	defer a.logMu.Unlock()
+	
 	f, err := os.OpenFile(logFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
 		fmt.Printf("❌ Failed to open log file: %v\n", err)
@@ -223,20 +379,44 @@ func (a *App) setupLogging() {
 }
 
 func (a *App) getRole(r *http.Request) string {
+	a.ConfigMu.RLock()
+	defer a.ConfigMu.RUnlock()
 	return serverauth.Role(r, a.Config)
 }
 
 func (a *App) getEffectiveRoot(r *http.Request) (string, error) {
+	a.ConfigMu.RLock()
+	defer a.ConfigMu.RUnlock()
 	return serverauth.EffectiveRoot(r, a.Config)
 }
 
 func (a *App) requireAuth(next http.HandlerFunc) http.HandlerFunc {
-	return serverauth.RequireAuth(next, a.Config)
+	return func(w http.ResponseWriter, r *http.Request) {
+		if a.getRole(r) == "none" {
+			ip, _, _ := net.SplitHostPort(r.RemoteAddr)
+			if ip == "" {
+				ip = r.RemoteAddr
+			}
+			if a.RateLimiter != nil {
+				a.RateLimiter.recordAuthFailure(ip)
+			}
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			return
+		}
+		next(w, r)
+	}
 }
 
 func (a *App) requireAdmin(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if serverauth.Role(r, a.Config) != "admin" {
+		if a.getRole(r) != "admin" {
+			ip, _, _ := net.SplitHostPort(r.RemoteAddr)
+			if ip == "" {
+				ip = r.RemoteAddr
+			}
+			if a.RateLimiter != nil {
+				a.RateLimiter.recordAuthFailure(ip)
+			}
 			http.Error(w, "Forbidden", http.StatusForbidden)
 			return
 		}
@@ -295,7 +475,14 @@ func (a *App) updateSystrayIP(ip string) {
 }
 
 func (a *App) restartMDNS() {
-	close(a.mdnsRestartCh)
+	a.mdnsMu.Lock()
+	defer a.mdnsMu.Unlock()
+	select {
+	case <-a.mdnsRestartCh:
+		// Already closed
+	default:
+		close(a.mdnsRestartCh)
+	}
 	a.mdnsRestartCh = make(chan struct{})
 }
 
@@ -317,21 +504,25 @@ func (a *App) generateSelfSignedCert() error {
 	}
 	log.Println("🔐 Generating self-signed TLS certificate...")
 
-	priv, err := rsa.GenerateKey(rand.Reader, 2048)
+	priv, err := rsa.GenerateKey(rand.Reader, 4096)
 	if err != nil {
 		return fmt.Errorf("keygen: %w", err)
 	}
 
+	serialNumberLimit := new(big.Int).Lsh(big.NewInt(1), 128)
+	serialNumber, _ := rand.Int(rand.Reader, serialNumberLimit)
+
 	template := x509.Certificate{
-		SerialNumber: big.NewInt(1),
+		SerialNumber: serialNumber,
 		Subject: pkix.Name{
 			Organization: []string{"K-Share Self-Signed"},
 		},
 		NotBefore:             time.Now(),
-		NotAfter:              time.Now().Add(365 * 24 * time.Hour),
+		NotAfter:              time.Now().Add(90 * 24 * time.Hour),
 		KeyUsage:              x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
 		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 		BasicConstraintsValid: true,
+		DNSNames:              []string{"localhost"},
 	}
 
 	addrs, err := net.InterfaceAddrs()
@@ -361,7 +552,7 @@ func (a *App) generateSelfSignedCert() error {
 	}
 	certOut.Close()
 
-	keyOut, err := os.Create(keyPath)
+	keyOut, err := os.OpenFile(keyPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
 	if err != nil {
 		return fmt.Errorf("create key file: %w", err)
 	}
@@ -391,7 +582,7 @@ func (a *App) loadIcon() []byte {
 	ico := new(bytes.Buffer)
 	mustWrite := func(v any) {
 		if err := binary.Write(ico, binary.LittleEndian, v); err != nil {
-			panic(err)
+			log.Printf("Error writing icon data: %v", err)
 		}
 	}
 
@@ -443,7 +634,7 @@ func generateIcon() []byte {
 	ico := new(bytes.Buffer)
 	mustWrite := func(v any) {
 		if err := binary.Write(ico, binary.LittleEndian, v); err != nil {
-			panic(err)
+			log.Printf("Error writing generated icon data: %v", err)
 		}
 	}
 
@@ -470,6 +661,11 @@ func (a *App) onReady() {
 	sentinel := filepath.Join(a.getAppDir(), ".context_menu_installed")
 	if _, err := os.Stat(sentinel); os.IsNotExist(err) {
 		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					log.Printf("Recovered from panic in ContextMenu install: %v", r)
+				}
+			}()
 			serverplatform.InstallContextMenu()
 			_ = os.WriteFile(sentinel, []byte("1"), 0o644)
 		}()
@@ -486,6 +682,11 @@ func (a *App) onReady() {
 	mExit := systray.AddMenuItem("Exit", "Quit K-Share")
 
 	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("Recovered from panic in systray loop: %v", r)
+			}
+		}()
 		for {
 			select {
 			case <-mOpenShared.ClickedCh:
@@ -506,6 +707,9 @@ func (a *App) onReady() {
 
 func (a *App) onExit() {
 	close(a.stopCh)
+	if a.Thumbnail != nil {
+		a.Thumbnail.Stop()
+	}
 	if a.server != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
@@ -513,8 +717,53 @@ func (a *App) onExit() {
 			log.Printf("Server shutdown error: %v", err)
 		}
 	}
+	
+	a.logMu.Lock()
+	defer a.logMu.Unlock()
 	if a.logFile != nil {
 		_ = a.logFile.Close()
+	}
+}
+
+func (a *App) rotateLogs(logFile string) {
+	const generations = 5
+	for i := generations - 1; i >= 1; i-- {
+		oldPath := fmt.Sprintf("%s.%d", logFile, i)
+		newPath := fmt.Sprintf("%s.%d", logFile, i+1)
+		_ = os.Rename(oldPath, newPath)
+	}
+	_ = os.Rename(logFile, logFile+".1")
+}
+
+func (a *App) startLogRotationChecker() {
+	ticker := time.NewTicker(1 * time.Hour)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			logFile := filepath.Join(a.getAppDir(), "server_log.txt")
+			if info, err := os.Stat(logFile); err == nil && info.Size() > 10*1024*1024 {
+				log.Println("🗑️ Rotating log file")
+				
+				a.logMu.Lock()
+				if a.logFile != nil {
+					_ = a.logFile.Close()
+				}
+				a.rotateLogs(logFile)
+				f, err := os.OpenFile(logFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+				if err == nil {
+					a.logFile = f
+					multi := io.MultiWriter(f, os.Stdout)
+					log.SetOutput(multi)
+				} else {
+					fmt.Printf("❌ Failed to reopen log file after rotation: %v\n", err)
+					log.SetOutput(os.Stdout)
+				}
+				a.logMu.Unlock()
+			}
+		case <-a.stopCh:
+			return
+		}
 	}
 }
 
@@ -562,7 +811,7 @@ func SendToPhone(filePath string) {
 		log.Fatalf("❌ File check failed: %v", err)
 	}
 
-	url := fmt.Sprintf("https://127.0.0.1:%s/upload?name=%s", cfg.Port, filepath.Base(filePath))
+	url := fmt.Sprintf("https://127.0.0.1:%s/upload?path=%s", cfg.Port, filepath.Base(filePath))
 
 	certPath := filepath.Join(serverconfig.AppDir(), "cert.pem")
 	certPEM, err := os.ReadFile(certPath)
@@ -611,8 +860,9 @@ type rateLimiter struct {
 }
 
 type rateLimitEntry struct {
-	tokens   int
-	lastSeen time.Time
+	tokens       int
+	authFailures int
+	lastSeen     time.Time
 }
 
 func newRateLimiter() *rateLimiter {
@@ -623,11 +873,29 @@ func (rl *rateLimiter) allow(ip string) bool {
 	rl.mu.Lock()
 	defer rl.mu.Unlock()
 	now := time.Now()
+
+	// Periodic cleanup (simple: 1 in 100 requests)
+	if time.Now().UnixNano()%100 == 0 {
+		for k, v := range rl.clients {
+			if now.Sub(v.lastSeen) > 10*time.Minute {
+				delete(rl.clients, k)
+			}
+		}
+	}
+
 	entry, ok := rl.clients[ip]
 	if !ok {
 		rl.clients[ip] = &rateLimitEntry{tokens: 99, lastSeen: now}
 		return true
 	}
+
+	if entry.authFailures > 10 {
+		if now.Sub(entry.lastSeen) < 1*time.Minute {
+			return false
+		}
+		entry.authFailures = 0 // Reset after timeout
+	}
+
 	elapsed := int(now.Sub(entry.lastSeen).Seconds())
 	entry.tokens += elapsed
 	if entry.tokens > 100 {
@@ -639,6 +907,17 @@ func (rl *rateLimiter) allow(ip string) bool {
 		return true
 	}
 	return false
+}
+
+func (rl *rateLimiter) recordAuthFailure(ip string) {
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+	if entry, ok := rl.clients[ip]; ok {
+		entry.authFailures++
+		entry.lastSeen = time.Now()
+	} else {
+		rl.clients[ip] = &rateLimitEntry{tokens: 100, authFailures: 1, lastSeen: time.Now()}
+	}
 }
 
 func (rl *rateLimiter) middleware(next http.Handler) http.Handler {
@@ -655,16 +934,21 @@ func (rl *rateLimiter) middleware(next http.Handler) http.Handler {
 	})
 }
 
-func securityHeaders(next http.Handler) http.Handler {
+func (a *App) securityHeaders(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("X-Frame-Options", "DENY")
-		w.Header().Set("Referrer-Policy", "strict-origin-when-cross-origin")
+		w.Header().Set("X-XSS-Protection", "1; mode=block")
+		w.Header().Set("Strict-Transport-Security", "max-age=63072000; includeSubDomains")
 		next.ServeHTTP(w, r)
 	})
 }
 
 func (a *App) withMiddleware(handler http.Handler) http.Handler {
-	rl := newRateLimiter()
-	return securityHeaders(rl.middleware(handler))
+	// RateLimiter is initialized in New(); do not reset it here
+	// to preserve auth failure state across requests.
+	if a.RateLimiter == nil {
+		a.RateLimiter = newRateLimiter()
+	}
+	return a.securityHeaders(a.RateLimiter.middleware(handler))
 }

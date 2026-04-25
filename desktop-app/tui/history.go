@@ -8,7 +8,6 @@ import (
 
 	"github.com/charmbracelet/bubbles/list"
 	tea "github.com/charmbracelet/bubbletea"
-	"golang.design/x/clipboard"
 )
 
 // historyListItem implements the list.Item interface
@@ -23,7 +22,9 @@ func (i historyListItem) FilterValue() string { return i.item.Text }
 // Command to fetch history
 func (m *AppModel) fetchHistoryCmd() tea.Cmd {
 	return func() tea.Msg {
-		items, err := m.historyOps.Load(context.Background())
+		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		defer cancel()
+		items, err := m.historyOps.Load(ctx)
 		if err != nil {
 			return historyOpResultMsg{err: err}
 		}
@@ -40,7 +41,11 @@ func (m *AppModel) updateHistoryList(msg tea.Msg) (tea.Model, tea.Cmd) {
 		for _, item := range msg.items {
 			listItems = append(listItems, historyListItem{item: item})
 		}
-		cmd = m.historyList.SetItems(listItems)
+		if len(listItems) == 0 {
+			m.historyList.SetItems([]list.Item{})
+		} else {
+			cmd = m.historyList.SetItems(listItems)
+		}
 		m.statusMsg = Branding.GetIcon(IconSuccess, "") + fmt.Sprintf("Loaded %d history items", len(msg.items))
 		return m, cmd
 
@@ -48,7 +53,8 @@ func (m *AppModel) updateHistoryList(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.isLoading = false
 		if msg.err != nil {
 			m.statusMsg = fmt.Sprintf("%s Error: %v", IconError, msg.err)
-			return m, nil
+			// Still refresh to stay in sync
+			return m, tea.Batch(m.fetchHistoryCmd(), m.clearToastCmd())
 		}
 		m.statusMsg = Branding.GetIcon(IconSuccess, "") + msg.msg
 		m.toastMsg = msg.msg
@@ -64,13 +70,12 @@ func (m *AppModel) updateHistoryList(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "enter", "c", "y":
 			// Copy to clipboard
 			if i, ok := m.historyList.SelectedItem().(historyListItem); ok {
-				clipboard.Write(clipboard.FmtText, []byte(i.item.Text))
 				m.statusMsg = Branding.GetIcon(IconSuccess, "") + "Copied: " + i.item.Text
 				if len(m.statusMsg) > 50 {
 					m.statusMsg = m.statusMsg[:47] + "..."
 				}
 				m.toastMsg = "Copied!"
-				return m, m.clearToastCmd()
+				return m, tea.Batch(m.copyToClipboardCmd(i.item.Text), m.clearToastCmd())
 			}
 		case "up", "k":
 			m.historyList.CursorUp()
@@ -92,8 +97,8 @@ func (m *AppModel) updateHistoryList(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		case "r":
 			m.isLoading = true
-			m.statusMsg = Branding.GetIcon(IconLoading, "") + "Fetching history..."
-			return m, m.fetchHistoryCmd()
+			m.statusMsg = Branding.GetIcon(IconLoading, "") + "Refreshing all..."
+			return m, tea.Batch(func() tea.Msg { return m.spinner.Tick() }, m.refreshAllCmd())
 		case "delete", "d":
 			if i, ok := m.historyList.SelectedItem().(historyListItem); ok {
 				m.showConfirm = true
@@ -107,7 +112,9 @@ func (m *AppModel) updateHistoryList(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 				m.pendingAction = func() tea.Cmd {
 					return func() tea.Msg {
-						err := m.historyOps.Delete(context.Background(), i.item.ID)
+						ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+						defer cancel()
+						err := m.historyOps.Delete(ctx, i.item.ID)
 						if err != nil {
 							return historyOpResultMsg{err: err}
 						}

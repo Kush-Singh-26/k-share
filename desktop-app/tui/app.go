@@ -1,13 +1,16 @@
 package tui
 
 import (
+	"context"
 	"desktop-app/api"
 	"desktop-app/clipboardops"
 	"desktop-app/config"
+	"desktop-app/discoveryops"
 	"desktop-app/fileops"
 	"desktop-app/historyops"
 	"desktop-app/platform"
 	"desktop-app/session"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -37,12 +40,14 @@ type AppModel struct {
 	fileOps    *fileops.Service
 	clipOps    *clipboardops.Service
 	historyOps *historyops.Service
+	discoveryOps *discoveryops.Service
 
 	// UI State
 	currentTab string // "history", "files", "clipboard", "settings"
 	width      int
 	height     int
 	ready      bool // true after receiving valid WindowSizeMsg
+	isConnected bool
 	statusMsg  string
 	toastMsg   string
 	isLoading  bool
@@ -68,6 +73,7 @@ type AppModel struct {
 	isUploading    bool
 	downloadProgress progress.Model
 	isDownloading   bool
+	clipboardInputFocused bool
 
 	// Settings Form
 	inputs      []textinput.Model
@@ -76,6 +82,9 @@ type AppModel struct {
 
 	// Clipboard channel ("" = private/main, "guest" = guest)
 	clipboardChannel string
+
+	// Clipboard sync tracking to prevent duplicate writes
+	lastRemoteClipboard string
 
 	// Confirmation Dialogs
 	showConfirm         bool
@@ -90,6 +99,10 @@ type AppModel struct {
 	clipLog []string
 
 	program *tea.Program
+
+	showTrustPrompt      bool
+	pendingTrustServerIP string
+	pendingTrustRole     string
 }
 
 type keyMap struct {
@@ -111,6 +124,8 @@ type keyMap struct {
 	Clear    key.Binding
 	CopyLog  key.Binding
 	ToggleChannel key.Binding
+	Discover key.Binding
+	DeleteWord key.Binding
 }
 
 func (k keyMap) ShortHelp() []key.Binding {
@@ -122,6 +137,7 @@ func (k keyMap) FullHelp() [][]key.Binding {
 		{k.Up, k.Down, k.Left, k.Right},
 		{k.Tab, k.Enter, k.Fetch, k.Push, k.CopyLog},
 		{k.SelectAll, k.Clear, k.Upload, k.Open, k.Delete, k.Help, k.Quit},
+		{k.DeleteWord, k.ToggleChannel, k.Discover},
 	}
 }
 
@@ -195,9 +211,16 @@ var keys = keyMap{
 		key.WithHelp("ctrl+l", "copy log"),
 	),
 	ToggleChannel: key.NewBinding(
-		key.WithKeys("ctrl+g"),
-		key.WithKeys("g"),
+		key.WithKeys("ctrl+g", "g"),
 		key.WithHelp("g", "toggle clipboard"),
+	),
+	Discover: key.NewBinding(
+		key.WithKeys("ctrl+d"),
+		key.WithHelp("ctrl+d", "discover server"),
+	),
+	DeleteWord: key.NewBinding(
+		key.WithKeys("ctrl+backspace", "ctrl+h", "alt+backspace"),
+		key.WithHelp("ctrl+backspace", "delete word"),
 	),
 }
 
@@ -230,11 +253,12 @@ func parseInt(s string) int {
 }
 
 func NewApp() *AppModel {
-	sess := session.New(config.Current.ServerIP, config.Current.PairingCode)
+	cfg := config.Get()
+	sess := session.New(cfg.ServerIP, cfg.PairingCode)
 	apiClient := sess.APIClient()
 	wsClient := sess.WSClient()
 
-	fileOps := fileops.New(apiClient, config.Current.DownloadFolder)
+	fileOps := fileops.New(apiClient, cfg.DownloadFolder)
 	clipOps := clipboardops.New(apiClient)
 	historyOps := historyops.New(apiClient)
 
@@ -278,6 +302,12 @@ func NewApp() *AppModel {
 	ta.Placeholder = "Type text to share and press Ctrl+S to push..."
 	ta.Blur()
 	ta.ShowLineNumbers = false
+	
+	// Add Ctrl+Left/Right and Ctrl+Backspace/Delete to textarea
+	ta.KeyMap.WordBackward = key.NewBinding(key.WithKeys("alt+left", "ctrl+left", "alt+b"))
+	ta.KeyMap.WordForward = key.NewBinding(key.WithKeys("alt+right", "ctrl+right", "alt+f"))
+	ta.KeyMap.DeleteWordBackward = key.NewBinding(key.WithKeys("alt+backspace", "ctrl+backspace", "ctrl+w", "ctrl+h"))
+	ta.KeyMap.DeleteWordForward = key.NewBinding(key.WithKeys("alt+delete", "ctrl+delete", "alt+d"))
 
 	// Setup Spinner
 	s := spinner.New()
@@ -289,28 +319,42 @@ func NewApp() *AppModel {
 
 	// Setup Settings Inputs
 	inputs := make([]textinput.Model, 3)
-	inputs[0] = textinput.New()
+	
+	// Add Ctrl shortcuts to inputs
+	for i := range inputs {
+		inputs[i] = textinput.New()
+		inputs[i].KeyMap.WordBackward = key.NewBinding(key.WithKeys("alt+left", "ctrl+left", "alt+b"))
+		inputs[i].KeyMap.WordForward = key.NewBinding(key.WithKeys("alt+right", "ctrl+right", "alt+f"))
+		inputs[i].KeyMap.DeleteWordBackward = key.NewBinding(key.WithKeys("alt+backspace", "ctrl+backspace", "ctrl+w", "ctrl+h"))
+		inputs[i].KeyMap.DeleteWordForward = key.NewBinding(key.WithKeys("alt+delete", "ctrl+delete", "alt+d"))
+	}
+
 	inputs[0].Placeholder = "Server IP (e.g., localhost:26260)"
-	inputs[0].SetValue(config.Current.ServerIP)
+	inputs[0].SetValue(cfg.ServerIP)
 	inputs[0].Focus()
 
-	inputs[1] = textinput.New()
 	inputs[1].Placeholder = "Pairing Code"
-	inputs[1].SetValue(config.Current.PairingCode)
+	inputs[1].SetValue(cfg.PairingCode)
+	inputs[1].EchoMode = textinput.EchoPassword
+	inputs[1].EchoCharacter = '•'
 
-	inputs[2] = textinput.New()
 	inputs[2].Placeholder = "Download Folder"
-	inputs[2].SetValue(config.Current.DownloadFolder)
+	inputs[2].SetValue(cfg.DownloadFolder)
+
+	// Setup Discovery Service
+	discOps := discoveryops.New(cfg.PairingCode)
 
 	app := &AppModel{
 		session:        sess,
 		apiClient:      apiClient,
 		wsClient:       wsClient,
 		fileOps:        fileOps,
-		clipOps:        clipOps,
+		clipOps:       clipOps,
 		historyOps:     historyOps,
+		discoveryOps:  discOps,
 		currentTab:     "history",
 		statusMsg:      "🔴 Disconnected",
+		isConnected:   false,
 		historyList:    hList,
 		filesList:      fList,
 		filePicker:     fp,
@@ -331,23 +375,31 @@ func NewApp() *AppModel {
 }
 
 func (m *AppModel) Run() error {
-	// Enable alternate screen and mouse support
+	// Enable alternate screen and mouse support for proper terminal handshake
 	p := tea.NewProgram(m, tea.WithAltScreen(), tea.WithMouseCellMotion())
 	m.program = p
 
-	// Register WebSocket Callbacks
-	m.wsClient.OnHistoryUpdate = func() {
-		m.program.Send(wsHistoryUpdateMsg{})
-	}
-	m.wsClient.OnFilesUpdate = func() {
-		m.program.Send(wsFilesUpdateMsg{})
-	}
-	m.wsClient.OnClipUpdate = func() {
-		m.program.Send(wsClipUpdateMsg{})
-	}
-	m.wsClient.OnStatusChange = func(status string) {
-		m.program.Send(wsStatusMsg{status: status})
-	}
+	// Register WebSocket Callbacks with nil checks to prevent crashes
+	m.wsClient.SetOnHistoryUpdate(func() {
+		if m.program != nil {
+			m.program.Send(wsHistoryUpdateMsg{})
+		}
+	})
+	m.wsClient.SetOnFilesUpdate(func() {
+		if m.program != nil {
+			m.program.Send(wsFilesUpdateMsg{})
+		}
+	})
+	m.wsClient.SetOnClipUpdate(func() {
+		if m.program != nil {
+			m.program.Send(wsClipUpdateMsg{})
+		}
+	})
+	m.wsClient.SetOnStatusChange(func(status string) {
+		if m.program != nil {
+			m.program.Send(wsStatusMsg{status: status})
+		}
+	})
 
 	_, err := p.Run()
 	return err
@@ -361,19 +413,100 @@ func (m *AppModel) clearToastCmd() tea.Cmd {
 	})
 }
 
+func (m *AppModel) connectCmd() tea.Cmd {
+	return func() tea.Msg {
+		role, err := m.session.Connect()
+		return connectionResultMsg{role: role, err: err}
+	}
+}
+
+func (m *AppModel) refreshAllCmd() tea.Cmd {
+	return tea.Batch(
+		func() tea.Msg { return m.spinner.Tick() },
+		m.connectCmd(),
+	)
+}
+
+func (m *AppModel) loadDataCmd() tea.Cmd {
+	return tea.Batch(
+		m.fetchHistoryCmd(),
+		m.fetchFilesCmd(),
+		m.fetchClipboardCmd(),
+	)
+}
+
+func (m *AppModel) completeConnectionCmd(role string) tea.Cmd {
+	return func() tea.Msg {
+		m.session.CompleteConnection(role)
+		return connectionCompletedMsg{role: role}
+	}
+}
+
+type connectionCompletedMsg struct {
+	role string
+}
+
+func (m *AppModel) copyToClipboardCmd(text string) tea.Cmd {
+	return func() tea.Msg {
+		clipboard.Write(clipboard.FmtText, []byte(text))
+		return clipboardWrittenMsg{text: text}
+	}
+}
+
+type clipboardWrittenMsg struct {
+	text string
+}
+
 func (m *AppModel) getHeaderView() string {
+	// Connection badge - use dedicated flag instead of parsing text
 	statusDot := "●"
 	dotColor := ErrorColor
-	if strings.Contains(m.statusMsg, "Connected") {
+	if m.isConnected {
 		dotColor = SuccessColor
 	}
-	statusIndicator := lipgloss.NewStyle().Foreground(dotColor).Render(statusDot)
+	connectedText := "Disconnected"
+	if m.isConnected {
+		connectedText = "Connected"
+	}
+	connectionBadge := lipgloss.JoinHorizontal(lipgloss.Center,
+		lipgloss.NewStyle().Foreground(dotColor).Render(statusDot),
+		" ",
+		lipgloss.NewStyle().Foreground(dotColor).Bold(true).Render(connectedText),
+	)
+
+	// Mode badge
+	modeText := "GUEST"
+	modeColor := DimTextColor
+	if !m.isGuestMode {
+		modeText = "ADMIN"
+		modeColor = SecondaryColor
+	}
+	modeBadge := lipgloss.NewStyle().
+		Foreground(modeColor).
+		Background(SurfaceColor).
+		Padding(0, 1).
+		Render("["+modeText+"]")
+
+	// Toast/Notification area - now part of header so it doesn't shift layout
+	toast := ""
+	if m.toastMsg != "" {
+		toast = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#FFFFFF")).
+			Background(SuccessColor).
+			Padding(0, 1).
+			Bold(true).
+			MarginLeft(2).
+			Render(m.toastMsg)
+	}
 
 	return lipgloss.JoinVertical(lipgloss.Left,
 		lipgloss.JoinHorizontal(lipgloss.Center,
-			TitleStyle.Render("K-Share Desktop"),
+			TitleStyle.Render("K-Share"),
 			" ",
-			statusIndicator,
+			connectionBadge,
+			"  ",
+			modeBadge,
+			toast,
 		),
 		"", // Spacer
 	)
@@ -386,57 +519,63 @@ func (m *AppModel) getFooterView() string {
 	}
 
 	statusText := spinnerView + m.statusMsg
+	
+	// Add role indicator (Admin/Guest)
+	if m.isConnected {
+		roleIndicator := "[ADMIN] "
+		if m.isGuestMode {
+			roleIndicator = "[GUEST] "
+		}
+		statusText += " " + lipgloss.NewStyle().Foreground(SecondaryColor).Render(roleIndicator)
+	}
+	
 	if m.currentTab == "files" && len(m.selectedFiles) > 0 {
 		statusText += fmt.Sprintf(" • %d selected", len(m.selectedFiles))
 	}
 
-	var helpView string
-	if m.help.ShowAll {
-		helpView = "" // Will be rendered at the bottom
-	} else {
-		helpView = m.help.ShortHelpView(keys.ShortHelp())
-	}
+	helpView := m.help.View(keys)
 
 	// Safety: ensure positive width even before terminal size is detected
-	safeWidth := m.width
-	if safeWidth < 10 {
-		safeWidth = 80 // Default fallback
+	if m.width <= 0 {
+		m.width = 80
 	}
 
-	leftWidth := safeWidth / 2
-	rightWidth := safeWidth - leftWidth - 4 // -4 accounts for StatusStyle padding (1+1 on each side)
-	if rightWidth < 10 {
-		rightWidth = 10
+	footerWidth := m.width - sidebarWidth - 1
+	if footerWidth < 0 {
+		footerWidth = 0
 	}
 
-	leftFooter := StatusStyle.Width(leftWidth).Render(statusText)
-	rightFooter := StatusStyle.Width(rightWidth).Align(lipgloss.Right).Render(helpView)
+	footerStyle := lipgloss.NewStyle().
+		Width(footerWidth).
+		Foreground(DimTextColor).
+		Padding(0, 1)
 
-	footer := lipgloss.JoinHorizontal(lipgloss.Top, leftFooter, rightFooter)
-
-	if m.toastMsg != "" {
-		// If toast is active, show it instead of help in the status bar
-		toast := ToastStyle.Width(rightWidth).Render(m.toastMsg)
-		footer = lipgloss.JoinHorizontal(lipgloss.Top, leftFooter, toast)
-	}
-
-	var bars []string
+	// Add progress bars for uploads/downloads if active
+	var progressViews []string
 	if m.isUploading {
-		bars = append(bars, m.uploadProgress.View())
+		progressViews = append(progressViews, "↑ "+m.uploadProgress.View())
 	}
 	if m.isDownloading {
-		bars = append(bars, m.downloadProgress.View())
-	}
-
-	if len(bars) > 0 {
-		footer = lipgloss.JoinVertical(lipgloss.Left, footer, strings.Join(bars, "\n"))
+		progressViews = append(progressViews, "↓ "+m.downloadProgress.View())
 	}
 
 	if m.help.ShowAll {
-		footer = lipgloss.JoinVertical(lipgloss.Left, footer, HelpStyle.Render(m.help.View(keys)))
+		// Full help is multi-line, render it separately from status text
+		return lipgloss.JoinVertical(lipgloss.Left,
+			footerStyle.Render(statusText),
+			"",
+			helpView,
+		)
 	}
 
-	return footer
+	if len(progressViews) > 0 {
+		progressText := lipgloss.NewStyle().
+			Foreground(SecondaryColor).
+			Render(strings.Join(progressViews, "  "))
+		return footerStyle.Render(statusText + "  " + progressText + "  " + helpView)
+	}
+
+	return footerStyle.Render(statusText + "  " + helpView)
 }
 
 func (m *AppModel) refreshLayout() {
@@ -451,25 +590,17 @@ func (m *AppModel) calcLayout() (int, int, int) {
 		safeWidth -= 1
 	}
 
-	headerHeight := lipgloss.Height(m.getHeaderView())
-	footerHeight := lipgloss.Height(m.getFooterView())
-	
-	// Safety: clamp header/footer heights to sensible ranges
-	// prevents negative mainHeight if lipgloss.Height returns garbage
-	if headerHeight <= 0 || headerHeight > 50 {
-		headerHeight = 10 // Estimate for header
-	}
-	if footerHeight <= 0 || footerHeight > 50 {
-		footerHeight = 5 // Minimum footer
-	}
+	// Fixed header/footer heights - no more lipgloss.Height calls
+	// This removes expensive double-rendering from every frame
+	headerHeight := 8
+	footerHeight := 4
 
 	mainHeight := m.height - headerHeight - footerHeight
 	if mainHeight < 10 {
 		mainHeight = 10 // Minimum usable height
 	}
 
-	sidebarView := SidebarStyle.Width(sidebarWidth).Height(mainHeight).Render("")
-	sidebarActualWidth := lipgloss.Width(sidebarView)
+	sidebarActualWidth := sidebarWidth
 
 	totalContentWidth := safeWidth - sidebarActualWidth
 	if totalContentWidth < 0 {
@@ -503,7 +634,6 @@ func (m *AppModel) syncComponentSizes(contentWidth, mainHeight int) {
 	// File picker dimensions
 	m.filePickerWidth = m.listWidth
 	m.filePickerHeight = m.listHeight - 2
-	m.filePicker, _ = m.filePicker.Update(tea.WindowSizeMsg{Width: m.filePickerWidth, Height: m.filePickerHeight})
 
 	// Clipboard panels
 	// Account for tabHeader(1) + instructions(1) + panel borders(2x2)
@@ -526,45 +656,38 @@ func (m *AppModel) syncComponentSizes(contentWidth, mainHeight int) {
 }
 
 func (m *AppModel) Init() tea.Cmd {
-	// Perform role detection via session
-	go func() {
-		role, err := m.session.Connect()
-		if err != nil {
-			// Send status to TUI instead of logging to stderr
-			// Logging to stderr during TUI can corrupt the display
-			m.program.Send(wsStatusMsg{status: "🔴 Connection Failed"})
-			return
-		}
+	// Set some reasonable defaults so View() doesn't render junk at size 0
+	m.width = 80
+	m.height = 24
 
-		// Complete the connection with the detected role
-		m.session.CompleteConnection(role)
-		m.program.Send(wsStatusMsg{status: "🟢 Connected as " + role})
-
-		// Set guest mode based on role
-		m.isGuestMode = (role == "guest")
-		m.clipboardChannel = m.session.ClipboardChannel()
-	}()
-
-	// Start background processes (like WS connection)
-	go func() {
-		m.wsClient.OnClipGuestUpdate = func() {
+	m.wsClient.SetOnClipGuestUpdate(func() {
+		if m.program != nil {
 			m.program.Send(wsClipGuestUpdateMsg{})
 		}
-
-		if err := m.wsClient.Connect(); err != nil {
-			// Send status to TUI instead of logging to stderr
-			// Logging to stderr during TUI can corrupt the display
-			m.program.Send(wsStatusMsg{status: "🔴 WS Connect Failed"})
-		}
-	}()
+	})
 
 	return tea.Batch(
 		tea.SetWindowTitle("K-Share TUI"),
 		tea.WindowSize(),
-		m.fetchHistoryCmd(),
-		m.fetchFilesCmd(),
-		m.spinner.Tick,
+		m.refreshAllCmd(),
 	)
+}
+
+func (m *AppModel) isAnyInputFocused() bool {
+	if m.showConfirm || m.showTrustPrompt {
+		return false
+	}
+	switch m.currentTab {
+	case "history":
+		return m.historyList.FilterState() == list.Filtering
+	case "files":
+		return m.filesList.FilterState() == list.Filtering || m.showFilePicker
+	case "clipboard":
+		return m.clipboardInputFocused
+	case "settings":
+		return true // Settings always has an input focused
+	}
+	return false
 }
 
 func (m *AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -585,133 +708,259 @@ func (m *AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 	case wsStatusMsg:
 		m.statusMsg = msg.status
-		m.refreshLayout() // Status changes footer height, need to refresh layout
+		if strings.Contains(msg.status, "Connected") {
+			m.isConnected = true
+		} else if strings.Contains(msg.status, "Disconnected") || strings.Contains(msg.status, "Failed") {
+			m.isConnected = false
+			m.isLoading = false
+		}
+	case connectionResultMsg:
+		m.isLoading = false
+		if msg.err != nil {
+			if errors.Is(msg.err, session.ErrTrustRequired) {
+				certInfo, serverIP, pendingRole, ok := m.session.PendingTrust()
+				if ok {
+					m.showTrustPrompt = true
+					m.pendingTrustServerIP = serverIP
+					m.pendingTrustRole = pendingRole
+					m.statusMsg = Branding.GetIcon(IconLoading, "") + "Certificate not trusted. Accept? (y/n)"
+					_ = certInfo
+				}
+			} else {
+				m.statusMsg = fmt.Sprintf("%s Connection Failed: %v", IconError, msg.err)
+				m.isConnected = false
+				// Auto-discovery fallback on connection failure
+				m.isLoading = true
+				m.statusMsg = Branding.GetIcon(IconLoading, "") + "Connection failed. Searching for server..."
+				cmds = append(cmds, func() tea.Msg {
+					ip := m.discoveryOps.Discover(26260, func(s string) {})
+					return discoveryResultMsg{ip: ip}
+				})
+			}
+		} else {
+			cmds = append(cmds, m.completeConnectionCmd(msg.role))
+		}
+	case connectionCompletedMsg:
+		m.isGuestMode = m.session.IsGuest()
+		m.clipboardChannel = m.session.ClipboardChannel()
+		m.isConnected = true
+		m.statusMsg = fmt.Sprintf("%s Connected as %s", Branding.GetIcon(IconSuccess, ""), msg.role)
+		cmds = append(cmds, m.loadDataCmd())
+	case sessionReconnectedMsg:
+		m.isLoading = true
+		cmds = append(cmds, m.refreshAllCmd())
+	case discoveryResultMsg:
+		m.isLoading = false
+		if msg.err != nil {
+			m.statusMsg = fmt.Sprintf("%s Discovery failed: %v", IconError, msg.err)
+		} else if msg.ip != "" {
+			m.statusMsg = fmt.Sprintf("%s Found server at %s", Branding.GetIcon(IconSuccess, ""), msg.ip)
+			m.inputs[0].SetValue(msg.ip)
+			// Update config and reconnect
+			_ = config.SetServerIP(msg.ip)
+			_ = config.Save()
+			m.statusMsg = Branding.GetIcon(IconLoading, "") + "Reconnecting..."
+			cmds = append(cmds, func() tea.Msg { return sessionReconnectedMsg{} })
+		} else {
+			m.statusMsg = fmt.Sprintf("%s No server found", IconError)
+		}
 	case spinner.TickMsg:
 		var cmd tea.Cmd
-		m.spinner, cmd = m.spinner.Update(msg)
+		if m.isLoading {
+			m.spinner, cmd = m.spinner.Update(msg)
+		}
 		return m, cmd
 	case clearToastMsg:
 		m.toastMsg = ""
-		return m, nil
 	case progress.FrameMsg:
-		progressModel, cmd := m.uploadProgress.Update(msg)
-		m.uploadProgress = progressModel.(progress.Model)
+		var cmd tea.Cmd
+		uploadModel, cmd := m.uploadProgress.Update(msg)
+		downloadModel, _ := m.downloadProgress.Update(msg)
+		m.uploadProgress = uploadModel.(progress.Model)
+		m.downloadProgress = downloadModel.(progress.Model)
 		return m, cmd
-case progressMsg:
+	case progressMsg:
 		if msg.isDownload {
-			cmd := m.downloadProgress.SetPercent(msg.percent)
-			if msg.percent >= 1.0 {
-				m.isDownloading = false
-			} else {
-				m.isDownloading = true
-			}
-			m.refreshLayout() // Progress bars change footer height
-			return m, cmd
+			m.downloadProgress.SetPercent(msg.percent)
+			m.isDownloading = msg.percent < 1.0
 		} else {
-		cmd := m.uploadProgress.SetPercent(msg.percent)
-		if msg.percent >= 1.0 {
-			m.isUploading = false
-		} else {
-			m.isUploading = true
+			m.uploadProgress.SetPercent(msg.percent)
+			m.isUploading = msg.percent < 1.0
 		}
-		m.refreshLayout() // Progress bars change footer height
-		return m, cmd
-	}
-
+	case clipboardReadMsg:
+		if len(msg.data) > 0 {
+			m.statusMsg = Branding.GetIcon(IconLoading, "") + "Uploading screenshot..."
+			cmds = append(cmds, func() tea.Msg {
+				ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+				defer cancel()
+				_, err := m.clipOps.UploadScreenshotWithPrefix(ctx, msg.data, m.currentPath)
+				if err != nil {
+					return filesOpResultMsg{err: err}
+				}
+				return filesOpResultMsg{msg: "Screenshot uploaded"}
+			})
+		} else if len(msg.text) > 0 {
+			m.statusMsg = Branding.GetIcon(IconLoading, "") + "Pushing text..."
+			cmds = append(cmds, func() tea.Msg {
+				ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+				defer cancel()
+				err := m.clipOps.PushText(ctx, msg.text, m.clipboardChannel)
+				if err != nil {
+					return filesOpResultMsg{err: err}
+				}
+				return filesOpResultMsg{msg: "Text pushed"}
+			})
+		} else {
+			m.isLoading = false
+			m.isUploading = false
+			m.statusMsg = "Nothing to paste"
+		}
 	case tea.KeyMsg:
+		key := msg.String()
+
 		if m.showConfirm {
-			switch msg.String() {
+			switch key {
 			case "y", "Y":
 				cmd := m.pendingAction()
 				m.showConfirm = false
 				m.pendingAction = nil
-				return m, cmd
+				cmds = append(cmds, cmd)
 			case "n", "N", "esc":
 				m.showConfirm = false
 				m.pendingAction = nil
-				return m, nil
 			}
-			return m, nil
+		} else if m.showTrustPrompt {
+			switch key {
+			case "y", "Y":
+				m.showTrustPrompt = false
+				m.session.TrustPending()
+				m.statusMsg = Branding.GetIcon(IconLoading, "") + "Trust accepted, reconnecting..."
+				m.isLoading = true
+				cmds = append(cmds, m.refreshAllCmd())
+			case "n", "N", "esc":
+				m.showTrustPrompt = false
+				m.session.CancelPendingTrust()
+				m.statusMsg = fmt.Sprintf("%s Connection Cancelled", IconError)
+			}
+		} else {
+			switch key {
+			case "ctrl+c":
+				return m, tea.Quit
+			case "q":
+				if !m.isAnyInputFocused() {
+					return m, tea.Quit
+				}
+			case "ctrl+o":
+				m.statusMsg = Branding.GetIcon(IconSuccess, "") + "Opening download folder..."
+				cmds = append(cmds, func() tea.Msg {
+					_ = platform.OpenFolder(config.Get().DownloadFolder)
+					return nil
+				})
+			case "ctrl+l":
+				text := m.statusMsg
+				icons := []string{IconSuccess, IconError, IconLoading, IconHistory, IconFiles, IconClipboard, IconSettings, IconServer, IconDelete}
+				for _, icon := range icons {
+					text = strings.TrimPrefix(text, icon)
+				}
+				text = strings.TrimSpace(text)
+				m.toastMsg = "Log Copied!"
+				cmds = append(cmds, m.copyToClipboardCmd(text), m.clearToastCmd())
+			case "?":
+				if !m.isAnyInputFocused() {
+					m.help.ShowAll = !m.help.ShowAll
+					return m, nil
+				}
+			case "tab":
+				if m.currentTab == "history" {
+					m.currentTab = "files"
+					m.clipboardInputFocused = false
+				} else if m.currentTab == "files" {
+					m.currentTab = "clipboard"
+					m.clipTextArea.Focus()
+					m.clipboardInputFocused = true
+				} else if m.currentTab == "clipboard" {
+					m.clipTextArea.Blur()
+					m.clipboardInputFocused = false
+					m.currentTab = "settings"
+				} else {
+					m.currentTab = "history"
+				}
+			case "shift+tab":
+				if m.currentTab == "settings" {
+					m.currentTab = "clipboard"
+					m.clipTextArea.Focus()
+					m.clipboardInputFocused = true
+				} else if m.currentTab == "clipboard" {
+					m.clipTextArea.Blur()
+					m.clipboardInputFocused = false
+					m.currentTab = "files"
+				} else if m.currentTab == "files" {
+					m.currentTab = "history"
+				} else {
+					m.clipboardInputFocused = false
+					m.currentTab = "settings"
+				}
+			case "ctrl+d":
+				// Discover server - only in settings tab
+				if m.currentTab == "settings" {
+					m.isLoading = true
+					m.statusMsg = Branding.GetIcon(IconLoading, "") + "Searching for server..."
+					cmds = append(cmds, func() tea.Msg {
+						ip := m.discoveryOps.Discover(26260, func(s string) {
+							_ = s // suppress unused warning
+						})
+						return discoveryResultMsg{ip: ip}
+					})
+				}
+			case "ctrl+v":
+				// Paste & Send - read clipboard and push/upload
+				m.isLoading = true
+				m.isUploading = true
+				m.statusMsg = Branding.GetIcon(IconLoading, "") + "Reading clipboard..."
+				cmds = append(cmds, func() tea.Msg {
+					// First try image clipboard
+					imgData := m.clipOps.ReadSystemImageClipboard()
+					if len(imgData) > 0 {
+						return clipboardReadMsg{data: imgData}
+					}
+					// Then try text clipboard using golang.design/x/clipboard
+					text := clipboard.Read(clipboard.FmtText)
+					if len(text) > 0 {
+						return clipboardReadMsg{text: string(text)}
+					}
+					return clipboardReadMsg{}
+				})
+			case "esc":
+				if m.currentTab == "clipboard" && m.clipboardInputFocused {
+					m.clipTextArea.Blur()
+					m.clipboardInputFocused = false
+					return m, nil
+				}
+			case "enter", "i":
+				if m.currentTab == "clipboard" && !m.clipboardInputFocused {
+					m.clipTextArea.Focus()
+					m.clipboardInputFocused = true
+					return m, nil
+				}
+			}
 		}
-
-		switch msg.String() {
-		case "ctrl+c":
-			return m, tea.Quit
-		case "ctrl+o":
-			m.statusMsg = Branding.GetIcon(IconSuccess, "") + "Opening download folder..."
-			return m, func() tea.Msg {
-				_ = platform.OpenFolder(config.Current.DownloadFolder)
-				return nil
-			}
-		case "ctrl+l":
-			text := m.statusMsg
-			// Basic cleanup: remove common icons if they are at the start
-			icons := []string{IconSuccess, IconError, IconLoading, IconHistory, IconFiles, IconClipboard, IconSettings, IconServer, IconDelete}
-			for _, icon := range icons {
-				text = strings.TrimPrefix(text, icon)
-			}
-			text = strings.TrimSpace(text)
-
-			clipboard.Write(clipboard.FmtText, []byte(text))
-			m.toastMsg = "Log Copied!"
-			return m, m.clearToastCmd()
-		case "?":
-			m.help.ShowAll = !m.help.ShowAll
-			m.refreshLayout() // Help toggle changes footer height
-			return m, nil
-		case "tab":
-			if m.currentTab == "history" {
-				m.currentTab = "files"
-			} else if m.currentTab == "files" {
-				m.currentTab = "clipboard"
-				m.clipTextArea.Focus()
-			} else if m.currentTab == "clipboard" {
-				m.clipTextArea.Blur()
-				m.currentTab = "settings"
-			} else {
-				m.currentTab = "history"
-			}
-			_, w, h := m.calcLayout()
-			m.syncComponentSizes(w, h)
-			return m, nil
-		case "shift+tab":
-			if m.currentTab == "settings" {
-				m.currentTab = "clipboard"
-				m.clipTextArea.Focus()
-			} else if m.currentTab == "clipboard" {
-				m.clipTextArea.Blur()
-				m.currentTab = "files"
-			} else if m.currentTab == "files" {
-				m.currentTab = "history"
-			} else {
-				m.currentTab = "settings"
-			}
-			_, w, h := m.calcLayout()
-			m.syncComponentSizes(w, h)
-			return m, nil
-		}
-
 	case tea.WindowSizeMsg:
-		// Ignore zero sizes - common in IDE terminals at startup
-		if msg.Width == 0 || msg.Height == 0 {
-			return m, nil
-		}
 		m.width = msg.Width
 		m.height = msg.Height
-		_, w, h := m.calcLayout()
-		m.syncComponentSizes(w, h)
-
-		// Mark ready and clear screen on first valid size
-		if !m.ready {
-			m.ready = true
-			return m, tea.ClearScreen
+		if m.width > 0 && m.height > 0 {
+			_, w, h := m.calcLayout()
+			m.syncComponentSizes(w, h)
+			if !m.ready {
+				m.ready = true
+				// Clear screen immediately when transitioning from unready to ready
+				return m, tea.ClearScreen
+			}
 		}
-		return m, nil
 	}
 
-	// Input Isolation: Route KeyMsg ONLY to the active tab
-	// Non-KeyMsgs go to all to handle background updates
-	if _, ok := msg.(tea.KeyMsg); ok {
+	// Route KeyMsg ONLY to the active tab
+	switch msg.(type) {
+	case tea.KeyMsg:
 		switch m.currentTab {
 		case "history":
 			updatedApp, cmd := m.updateHistoryList(msg)
@@ -730,9 +979,8 @@ case progressMsg:
 			m = updatedApp.(*AppModel)
 			cmds = append(cmds, cmd)
 		}
-	} else {
-		// Non-Key messages (like network updates) go to all components
-
+	default:
+		// Non-Key messages go to ALL components
 		updatedApp, cmd1 := m.updateHistoryList(msg)
 		m = updatedApp.(*AppModel)
 		cmds = append(cmds, cmd1)
@@ -784,6 +1032,23 @@ func (m *AppModel) View() string {
 	
 	// Enforce sidebar width and height strictly to prevent it from disappearing
 	sidebarContent := lipgloss.JoinVertical(lipgloss.Left, renderedTabs...)
+
+	// Add logo below tabs if there's enough space
+	if mainHeight >= 12 {
+		sidebarLogo := LogoStyle.Render(RenderLogo(sidebarWidth - 2))
+		kShareText := lipgloss.NewStyle().
+			Foreground(SecondaryColor).
+			Align(lipgloss.Center).
+			Width(sidebarWidth - 2).
+			Render("K-Share")
+		sidebarContent = lipgloss.JoinVertical(
+			lipgloss.Left,
+			sidebarContent,
+			sidebarLogo,
+			kShareText,
+		)
+	}
+
 	sidebar := SidebarStyle.
 		Width(sidebarWidth).
 		MaxWidth(sidebarWidth).
@@ -809,19 +1074,65 @@ func (m *AppModel) View() string {
 			),
 		)
 		content = lipgloss.Place(innerContentWidth, mainHeight, lipgloss.Center, lipgloss.Center, dialogBox)
+	} else if m.showTrustPrompt {
+		WarningColor := lipgloss.NewStyle().Foreground(ErrorColor)
+		trustBox := DialogStyle.Width(60).Render(
+			lipgloss.JoinVertical(lipgloss.Center,
+				WarningColor.Render("⚠  Untrusted Certificate"),
+				"",
+				LabelStyle.Render("Server:"),
+				DimTextStyle.Render(m.pendingTrustServerIP),
+				"",
+				LabelStyle.Render("Detected Role:"),
+				DimTextStyle.Render(m.pendingTrustRole),
+				"",
+				DimTextStyle.Render("This server's certificate has not been trusted yet."),
+				DimTextStyle.Render("Trusting it will store its certificate locally."),
+				"",
+				"(Y) Trust & Connect  /  (N) Cancel",
+			),
+		)
+		content = lipgloss.Place(innerContentWidth, mainHeight, lipgloss.Center, lipgloss.Center, trustBox)
 	} else {
 		switch m.currentTab {
 		case "history":
 			title := HeaderStyle.Render("History (" + IconHistory + ")")
 			instructions := DimTextStyle.Render("Enter/C: Copy | R: Refresh | Del: Delete")
-			content = lipgloss.JoinVertical(lipgloss.Left, title, instructions, "", m.historyList.View())
+			listView := m.historyList.View()
+			if len(m.historyList.Items()) == 0 {
+				emptyState := lipgloss.NewStyle().
+					Foreground(DimTextColor).
+					Align(lipgloss.Center).
+					Render("No history items yet.\n\nUse R to refresh.\nOr copy something to get started!")
+				listView = lipgloss.Place(innerContentWidth-2, mainHeight-6, lipgloss.Center, lipgloss.Center, emptyState)
+			}
+			content = lipgloss.JoinVertical(lipgloss.Left, title, instructions, "", listView)
 		case "files":
 			title := HeaderStyle.Render("Remote Files (" + IconFiles + ")")
-			instructions := DimTextStyle.Render("Space: Mark | Ctrl+A: All | Nav: Move | Enter: Enter/Dwnld")
+			
+			displayPath := "/ (Root)"
+			if m.currentPath != "" {
+				displayPath = "/" + m.currentPath
+			}
+			pathView := lipgloss.NewStyle().
+				Foreground(SecondaryColor).
+				Bold(true).
+				Padding(0, 1).
+				Render("📂 " + displayPath)
+
+			instructions := DimTextStyle.Render("Enter: Open | Shift+Enter: Download | Alt+Enter: Download Current | Space: Mark")
 			if m.showFilePicker {
 				content = "Select a file to upload (ESC to cancel):\n\n" + m.filePicker.View()
 			} else {
-				content = lipgloss.JoinVertical(lipgloss.Left, title, instructions, "", m.filesList.View())
+				listView := m.filesList.View()
+				if len(m.filesList.Items()) == 0 && m.currentPath == "" {
+					emptyState := lipgloss.NewStyle().
+						Foreground(DimTextColor).
+						Align(lipgloss.Center).
+						Render("No files found.\n\nUse U to upload files.\nOr wait for others to share.")
+					listView = lipgloss.Place(innerContentWidth-2, mainHeight-6, lipgloss.Center, lipgloss.Center, emptyState)
+				}
+				content = lipgloss.JoinVertical(lipgloss.Left, title, pathView, instructions, "", listView)
 			}
 		case "clipboard":
 			channelLabel := "PRIVATE"
@@ -833,22 +1144,27 @@ func (m *AppModel) View() string {
 			if !m.isGuestMode {
 				instrChannel = "Ctrl+G: Toggle | "
 			}
-			instructions := DimTextStyle.Render(instrChannel + "Ctrl+S: Push | Ctrl+R: Fetch")
+			instructions := DimTextStyle.Render(instrChannel + "Ctrl+S: Push | Ctrl+R: Fetch | Enter/i: Focus | Esc: Blur")
 			
 			panelWidth := innerContentWidth - 6 // -6 accounts for PanelStyle padding (4) + border (2)
 			if panelWidth < 0 {
 				panelWidth = 0
 			}
 
-			inputBox := PanelStyle.Width(panelWidth).Render(
-				LabelStyle.Render("Input Area:") + "\n" +
-				m.clipTextArea.View(),
-			)
-
-			logBox := PanelStyle.Width(panelWidth).Render(
-				LabelStyle.Render("Sync Log:") + "\n" +
-				m.clipViewport.View(),
-			)
+			// Apply focus styles to panels based on current focus state
+			inputLabel := "Input Area:"
+			logLabel := "Sync Log:"
+			
+			var inputBox, logBox string
+			if m.clipboardInputFocused {
+				inputLabelStyle := FocusLabelStyle.Width(panelWidth)
+				inputBox = inputLabelStyle.Render(inputLabel) + "\n" + m.clipTextArea.View()
+				logBox = PanelStyle.Width(panelWidth).Render(logLabel + "\n" + m.clipViewport.View())
+			} else {
+				logLabelStyle := FocusLabelStyle.Width(panelWidth)
+				logBox = logLabelStyle.Render(logLabel) + "\n" + m.clipViewport.View()
+				inputBox = PanelStyle.Width(panelWidth).Render(inputLabel + "\n" + m.clipTextArea.View())
+			}
 
 			content = lipgloss.JoinVertical(lipgloss.Left, tabHeader, instructions, inputBox, logBox)
 		case "settings":
@@ -868,9 +1184,11 @@ func (m *AppModel) View() string {
 	// Ensure sidebar is joined with content accurately using JoinHorizontal
 	mainSection := lipgloss.JoinHorizontal(lipgloss.Top, sidebar, styledContent)
 
-	return lipgloss.JoinVertical(lipgloss.Left,
+	mainUI := lipgloss.JoinVertical(lipgloss.Left,
 		header,
 		mainSection,
 		footer,
 	)
+
+	return mainUI
 }

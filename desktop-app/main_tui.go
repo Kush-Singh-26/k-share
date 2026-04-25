@@ -12,6 +12,12 @@ import (
 )
 
 func main() {
+	defer func() {
+		if r := recover(); r != nil {
+			// Ensure TUI is exited if possible, though panic usually means it's gone
+			print("Critical panic in TUI: ", r, "\n")
+		}
+	}()
 	// Initialize clipboard for image support
 	if err := clipboard.Init(); err != nil {
 		// Silent fail - don't print to terminal during TUI

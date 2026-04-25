@@ -15,8 +15,8 @@ import (
 func TestCachePathDeterministic(t *testing.T) {
 	store := NewWithCacheDir(t.TempDir())
 	modTime := time.Unix(123, 0)
-	first := store.CachePath("file.png", modTime)
-	second := store.CachePath("file.png", modTime)
+	first := store.CachePath("file.png", modTime, 0)
+	second := store.CachePath("file.png", modTime, 0)
 	if first != second {
 		t.Fatalf("CachePath() = %q and %q, want same value", first, second)
 	}
@@ -34,7 +34,7 @@ func TestServeGeneratesThumbnail(t *testing.T) {
 
 	req := httptest.NewRequest(http.MethodGet, "https://example.com/thumbnail?name=image.png", nil)
 	rec := httptest.NewRecorder()
-	if err := store.Serve(rootDir, "image.png", "", rec, req); err != nil {
+	if err := store.Serve(rootDir, "image.png", rec, req); err != nil {
 		t.Fatalf("Serve() returned error: %v", err)
 	}
 
@@ -50,7 +50,7 @@ func TestServeGeneratesThumbnail(t *testing.T) {
 	// Wait for async generation
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
-		if _, err := os.Stat(store.CachePath("image.png", info.ModTime())); err == nil {
+		if _, err := os.Stat(store.CachePath("image.png", info.ModTime(), info.Size())); err == nil {
 			break
 		}
 		time.Sleep(50 * time.Millisecond)
@@ -59,7 +59,7 @@ func TestServeGeneratesThumbnail(t *testing.T) {
 	// Second call should return 200 OK
 	req = httptest.NewRequest(http.MethodGet, "https://example.com/thumbnail?name=image.png", nil)
 	rec = httptest.NewRecorder()
-	if err := store.Serve(rootDir, "image.png", "", rec, req); err != nil {
+	if err := store.Serve(rootDir, "image.png", rec, req); err != nil {
 		t.Fatalf("Serve() second call returned error: %v", err)
 	}
 

@@ -10,8 +10,9 @@ type filesLoadedMsg struct {
 }
 
 type filesOpResultMsg struct {
-	msg string
-	err error
+	msg    string
+	status string
+	err    error
 }
 
 type historyLoadedMsg struct {
@@ -19,13 +20,15 @@ type historyLoadedMsg struct {
 }
 
 type historyOpResultMsg struct {
-	msg string
-	err error
+	msg    string
+	status string
+	err    error
 }
 
 type clipOpResultMsg struct {
-	msg string
-	err error
+	msg    string
+	status string
+	err    error
 }
 
 type wsClipUpdateMsg struct{}
@@ -35,4 +38,25 @@ type wsFilesUpdateMsg struct{}
 
 type wsStatusMsg struct {
 	status string
+}
+
+type connectionResultMsg struct {
+	role           string
+	err            error
+}
+
+type sessionReconnectedMsg struct{}
+
+type trustResultMsg struct {
+	trusted bool
+}
+
+type discoveryResultMsg struct {
+	ip   string
+	err  error
+}
+
+type clipboardReadMsg struct {
+	text string
+	data []byte
 }

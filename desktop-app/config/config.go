@@ -26,7 +26,7 @@ type Config struct {
 var (
 	configPath string
 	mu         sync.RWMutex
-	Current    = &Config{
+	current    = &Config{
 		ServerIP:          "localhost:26260",
 		DownloadFolder:    getDefaultDownloadFolder(),
 		AutoSyncClipboard: true,
@@ -62,13 +62,13 @@ func getConfigDir() string {
 func Load() error {
 	mu.Lock()
 	defer mu.Unlock()
-	return loadFromPath(configPath, Current)
+	return loadFromPath(configPath, current)
 }
 
 func Save() error {
 	mu.Lock()
 	defer mu.Unlock()
-	return saveToPath(configPath, Current)
+	return saveToPath(configPath, current)
 }
 
 func Get() Config {
@@ -76,15 +76,15 @@ func Get() Config {
 	defer mu.RUnlock()
 	
 	// Create a shallow copy + deep copies for maps
-	cfg := *Current
+	cfg := *current
 	
 	cfg.SavedNetworks = make(map[string]string)
-	for k, v := range Current.SavedNetworks {
+	for k, v := range current.SavedNetworks {
 		cfg.SavedNetworks[k] = v
 	}
 	
 	cfg.KnownServers = make(map[string]ServerIdentity)
-	for k, v := range Current.KnownServers {
+	for k, v := range current.KnownServers {
 		cfg.KnownServers[k] = v
 	}
 	
@@ -132,68 +132,76 @@ func saveToPath(path string, cfg *Config) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, data, 0644)
+	tmpPath := path + ".tmp"
+	if err := os.WriteFile(tmpPath, data, 0o600); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpPath, path); err != nil {
+		_ = os.Remove(tmpPath)
+		return err
+	}
+	return nil
 }
 
 func SetServerIP(ip string) error {
 	mu.Lock()
 	defer mu.Unlock()
-	Current.ServerIP = ip
-	return nil
+	current.ServerIP = ip
+	return saveToPath(configPath, current)
 }
 
 func SetPairingCode(code string) error {
 	mu.Lock()
 	defer mu.Unlock()
-	Current.PairingCode = code
-	return nil
+	current.PairingCode = code
+	return saveToPath(configPath, current)
 }
 
 func SetDownloadFolder(folder string) error {
 	mu.Lock()
 	defer mu.Unlock()
-	Current.DownloadFolder = folder
+	current.DownloadFolder = folder
 	return nil
 }
 
 func AddSavedNetwork(subnet, ip string) error {
 	mu.Lock()
 	defer mu.Unlock()
-	ensureDefaults(Current)
-	Current.SavedNetworks[subnet] = ip
-	return saveToPath(configPath, Current)
+	ensureDefaults(current)
+	current.SavedNetworks[subnet] = ip
+	return saveToPath(configPath, current)
 }
 
 func RemoveSavedNetwork(subnet string) error {
 	mu.Lock()
 	defer mu.Unlock()
-	ensureDefaults(Current)
-	delete(Current.SavedNetworks, subnet)
-	return saveToPath(configPath, Current)
+	ensureDefaults(current)
+	delete(current.SavedNetworks, subnet)
+	return saveToPath(configPath, current)
 }
 
 func SetKnownServer(certHash string, identity ServerIdentity) error {
 	mu.Lock()
 	defer mu.Unlock()
-	ensureDefaults(Current)
-	Current.KnownServers[certHash] = identity
-	return saveToPath(configPath, Current)
+	ensureDefaults(current)
+	current.KnownServers[certHash] = identity
+	return saveToPath(configPath, current)
 }
 
 func RemoveKnownServer(certHash string) error {
 	mu.Lock()
 	defer mu.Unlock()
-	ensureDefaults(Current)
-	delete(Current.KnownServers, certHash)
-	return saveToPath(configPath, Current)
+	ensureDefaults(current)
+	delete(current.KnownServers, certHash)
+	return saveToPath(configPath, current)
 }
 
 func IsServerKnown(certHash string) bool {
 	mu.RLock()
 	defer mu.RUnlock()
-	if Current.KnownServers == nil {
+	if current.KnownServers == nil {
 		return false
 	}
-	_, exists := Current.KnownServers[certHash]
+	_, exists := current.KnownServers[certHash]
 	return exists
 }

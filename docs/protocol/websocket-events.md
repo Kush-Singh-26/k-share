@@ -1,5 +1,8 @@
 # WebSocket Events
 
+> **Version**: 1.0
+> **Last Updated**: 2026-04-25
+
 The server uses a small typed event stream so clients can refresh state without polling.
 
 Event format:

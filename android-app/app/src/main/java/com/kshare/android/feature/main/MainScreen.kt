@@ -29,6 +29,7 @@ import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.Home
 import androidx.compose.material.icons.filled.Menu
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material3.AlertDialog
@@ -95,6 +96,9 @@ fun MainScreen(
     onDismissDeleteRequest: () -> Unit,
     onAcceptTrust: () -> Unit,
     onDismissTrust: () -> Unit,
+    onNavigateToFolder: (String) -> Unit,
+    onNavigateToPath: (String) -> Unit,
+    onNavigateUp: () -> Unit,
 ) {
     if (showTrustDialog) {
         AlertDialog(
@@ -345,6 +349,37 @@ fun MainScreen(
                         keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search)
                     )
                 }
+
+                if (state.currentPath.isNotEmpty() || state.fileList.isNotEmpty()) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable { onNavigateToPath("") }
+                            .padding(vertical = 8.dp, horizontal = 12.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Icon(
+                            Icons.Default.Home,
+                            "Root",
+                            modifier = Modifier.size(20.dp),
+                            tint = MaterialTheme.colorScheme.primary
+                        )
+                        state.currentPath.split("/").forEachIndexed { index, part ->
+                            Text(" / ", fontSize = 14.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            Text(
+                                part,
+                                fontSize = 14.sp,
+                                color = MaterialTheme.colorScheme.primary,
+                                fontWeight = FontWeight.Bold,
+                                modifier = Modifier.clickable {
+                                    val targetPath = state.currentPath.split("/").take(index + 1).joinToString("/")
+                                    onNavigateToPath(targetPath)
+                                }
+                            )
+                        }
+                    }
+                }
+
                 if (state.isRefreshing) {
                     LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
                 }
@@ -356,6 +391,8 @@ fun MainScreen(
                             serverPort = state.serverPort,
                             pairingCode = thumbnailPairingCode,
                             isGuestMode = state.isGuestMode,
+                            currentPath = state.currentPath,
+                            onNavigateToFolder = onNavigateToFolder,
                             onDownloadFile = onDownloadFile,
                             onRequestDeleteFile = onRequestDeleteFile
                         )
@@ -378,6 +415,8 @@ private fun FileItem(
     serverPort: String,
     pairingCode: String,
     isGuestMode: Boolean,
+    currentPath: String,
+    onNavigateToFolder: (String) -> Unit,
     onDownloadFile: (RemoteFile) -> Unit,
     onRequestDeleteFile: (RemoteFile) -> Unit
 ) {
@@ -400,7 +439,10 @@ private fun FileItem(
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .clickable { onDownloadFile(file) }
+            .then(
+                if (file.isDir) Modifier.clickable { onNavigateToFolder(file.name) }
+                else Modifier.clickable { onDownloadFile(file) }
+            )
             .padding(12.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
@@ -451,7 +493,17 @@ private fun FileItem(
             )
         }
 
-        if (!isGuestMode) {
+        if (file.isDir) {
+            IconButton(onClick = { onDownloadFile(file) }) {
+                Icon(
+                    painter = painterResource(android.R.drawable.ic_menu_save),
+                    "Download Folder",
+                    tint = MaterialTheme.colorScheme.primary
+                )
+            }
+        }
+
+        if (!isGuestMode && !file.isDir) {
             IconButton(onClick = { onRequestDeleteFile(file) }) {
                 Icon(Icons.Default.Delete, "Delete", tint = MaterialTheme.colorScheme.error)
             }
