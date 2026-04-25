@@ -147,9 +147,10 @@ jobs:
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
-          files: artifacts/**/*.exe
-          files: artifacts/build-gui/k-share-desktop-*
-          files: artifacts/*/k-share-tui-*
-          files: artifacts/*/k-share-server-*
+          files: |
+            artifacts/**/*.exe
+            artifacts/build-gui/k-share-desktop-*
+            artifacts/*/k-share-tui-*
+            artifacts/*/k-share-server-*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
