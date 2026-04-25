@@ -36,23 +36,25 @@ jobs:
         if: matrix.os == 'linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libayatana-appindicator3-dev libx11-dev
+          sudo apt-get install -y libayatana-appindicator3-dev libx11-dev libxcursor-dev libxinerama-dev libxrandr-dev libxf86vm-dev libgl1-mesa-dev
 
       - name: Build server
         working-directory: server
         shell: bash
         run: |
-          EXT=""
           if [ "${{ matrix.os }}" = "windows" ]; then
-            EXT=".exe"
+            go install github.com/tc-hib/go-winres@latest
+            go-winres make
+            CGO_ENABLED=1 GOOS=windows GOARCH=amd64 go build -trimpath -ldflags="-s -w -H windowsgui" -o ../k-share-server.exe
+          else
+            CGO_ENABLED=1 GOOS=${{ matrix.os }} GOARCH=${{ matrix.arch }} go build -trimpath -ldflags="-s -w" -o ../k-share-server-${{ matrix.os }}-${{ matrix.arch }}
           fi
-          CGO_ENABLED=1 GOOS=${{ matrix.os }} GOARCH=${{ matrix.arch }} go build -trimpath -ldflags="-s -w" -o ../k-share-server-${{ matrix.os }}-${{ matrix.arch }}${EXT}
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: server-${{ matrix.os }}-${{ matrix.arch }}
-          path: k-share-server-${{ matrix.os }}-${{ matrix.arch }}*
+          path: k-share-server*
 
   build-tui:
     runs-on: ${{ matrix.runner }}
@@ -81,23 +83,23 @@ jobs:
         if: matrix.os == 'linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libx11-dev
+          sudo apt-get install -y libx11-dev libxcursor-dev libxinerama-dev libxrandr-dev libxf86vm-dev libgl1-mesa-dev
 
       - name: Build TUI
         working-directory: desktop-app
         shell: bash
         run: |
-          EXT=""
           if [ "${{ matrix.os }}" = "windows" ]; then
-            EXT=".exe"
+            CGO_ENABLED=1 GOOS=windows GOARCH=amd64 go build -tags tui -trimpath -ldflags="-s -w" -o ../k-share-tui.exe main_tui.go
+          else
+            CGO_ENABLED=1 GOOS=${{ matrix.os }} GOARCH=${{ matrix.arch }} go build -tags tui -trimpath -ldflags="-s -w" -o ../k-share-tui-${{ matrix.os }}-${{ matrix.arch }} main_tui.go
           fi
-          CGO_ENABLED=1 GOOS=${{ matrix.os }} GOARCH=${{ matrix.arch }} go build -tags tui -trimpath -ldflags="-s -w" -o ../k-share-tui-${{ matrix.os }}-${{ matrix.arch }}${EXT} main_tui.go
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: tui-${{ matrix.os }}-${{ matrix.arch }}
-          path: k-share-tui-${{ matrix.os }}-${{ matrix.arch }}*
+          path: k-share-tui*
 
   build-gui:
     needs: build-server
@@ -124,7 +126,7 @@ jobs:
         if: matrix.target == 'linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libgtk-3-dev libglib2.0-dev libayatana-appindicator3-dev liblzma-dev libstdc++-12-dev
+          sudo apt-get install -y libgtk-3-dev libgl1-mesa-dev xorg-dev libayatana-appindicator3-dev liblzma-dev libstdc++-12-dev
 
       - name: Build GUI
         working-directory: desktop-app
@@ -134,20 +136,22 @@ jobs:
 
       - name: Rename artifact
         if: matrix.target == 'darwin'
+        working-directory: desktop-app
         run: mv k-share-desktop.app k-share-desktop-macos-arm64.app
 
       - name: Zip macOS app
         if: matrix.target == 'darwin'
-        run: zip -r k-share-desktop-macos-arm64.zip k-share-desktop-macos-arm64.app
+        working-directory: desktop-app
+        run: zip -r ../k-share-desktop-macos-arm64.zip k-share-desktop-macos-arm64.app
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: gui-${{ matrix.target }}
           path: |
-            k-share-desktop-*
-            !*.app
-            !*.zip
+            desktop-app/k-share-desktop*
+            !desktop-app/*.app
+            !desktop-app/*.zip
 
       - name: Upload macOS app
         if: matrix.target == 'darwin'
@@ -175,7 +179,8 @@ jobs:
             artifacts/**/*.exe
             artifacts/**/*.tar.gz
             artifacts/**/*.zip
-            artifacts/tui-*/k-share-tui-*
-            artifacts/server-*/k-share-server-*
+            artifacts/tui-*/*
+            artifacts/server-*/*
+            artifacts/gui-*/*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
