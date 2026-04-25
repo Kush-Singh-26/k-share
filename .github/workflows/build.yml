@@ -10,17 +10,17 @@ permissions:
 
 jobs:
   build-server:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
         include:
           - os: linux
-            ext: ""
+            runner: ubuntu-latest
           - os: windows
-            ext: ".exe"
-          - os: macos
-            ext: ""
+            runner: windows-latest
+          - os: darwin
+            runner: macos-latest
     steps:
       - uses: actions/checkout@v4
 
@@ -29,8 +29,15 @@ jobs:
         with:
           go-version: '1.26'
 
+      - name: Install dependencies
+        if: matrix.os == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libayatana-appindicator3-dev libx11-dev
+
       - name: Build server
         working-directory: server
+        shell: bash
         run: |
           EXT=""
           if [ "${{ matrix.os }}" = "windows" ]; then
@@ -45,17 +52,17 @@ jobs:
           path: k-share-server-${{ matrix.os }}-amd64*
 
   build-tui:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
         include:
           - os: linux
-            ext: ""
+            runner: ubuntu-latest
           - os: windows
-            ext: ".exe"
-          - os: macos
-            ext: ""
+            runner: windows-latest
+          - os: darwin
+            runner: macos-latest
     steps:
       - uses: actions/checkout@v4
 
@@ -64,8 +71,15 @@ jobs:
         with:
           go-version: '1.26'
 
+      - name: Install dependencies
+        if: matrix.os == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libx11-dev
+
       - name: Build TUI
         working-directory: desktop-app
+        shell: bash
         run: |
           EXT=""
           if [ "${{ matrix.os }}" = "windows" ]; then
