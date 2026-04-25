@@ -20,7 +20,7 @@ jobs:
           - os: windows
             runner: windows-latest
           - os: darwin
-            runner: macos-latest
+            runner: macos-13
     steps:
       - uses: actions/checkout@v4
 
@@ -43,13 +43,7 @@ jobs:
           if [ "${{ matrix.os }}" = "windows" ]; then
             EXT=".exe"
           fi
-          GOOS=${{ matrix.os }} GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o ../k-share-server-${{ matrix.os }}-amd64${EXT}
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: server-${{ matrix.os }}-amd64
-          path: k-share-server-${{ matrix.os }}-amd64*
+          CGO_ENABLED=1 GOOS=${{ matrix.os }} GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o ../k-share-server-${{ matrix.os }}-amd64${EXT}
 
   build-tui:
     runs-on: ${{ matrix.runner }}
@@ -62,7 +56,7 @@ jobs:
           - os: windows
             runner: windows-latest
           - os: darwin
-            runner: macos-latest
+            runner: macos-13
     steps:
       - uses: actions/checkout@v4
 
@@ -85,7 +79,7 @@ jobs:
           if [ "${{ matrix.os }}" = "windows" ]; then
             EXT=".exe"
           fi
-          GOOS=${{ matrix.os }} GOARCH=amd64 go build -tags tui -trimpath -ldflags="-s -w" -o ../k-share-tui-${{ matrix.os }}-amd64${EXT} main_tui.go
+          CGO_ENABLED=1 GOOS=${{ matrix.os }} GOARCH=amd64 go build -tags tui -trimpath -ldflags="-s -w" -o ../k-share-tui-${{ matrix.os }}-amd64${EXT} main_tui.go
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
